@@ -641,28 +641,52 @@ def live_voice():
 app = Flask(__name__)
 
 CSS = """
+@import url('https://rsms.me/inter/inter.css');
 :root {
-  --bg-darker: #1a1b1e;
-  --bg-dark:   #232428;
-  --bg:        #2b2d31;
-  --bg-elev:   #313338;
-  --bg-hover:  #3b3d44;
-  --border:    #1a1b1e;
-  --text:      #f2f3f5;
-  --muted:     #b5bac1;
-  --dim:       #949ba4;
-  --accent:    #5865f2;
-  --accent-h:  #4752c4;
-  --green:     #23a55a;
-  --yellow:    #f0b232;
-  --red:       #f23f43;
-  --grey:      #80848e;
+  /* Discord's exact 2024+ palette */
+  --bg-tertiary:  #1e1f22;   /* deepest — server list / dividers */
+  --bg-secondary: #2b2d31;   /* sidebar */
+  --bg-primary:   #313338;   /* main chat area */
+  --bg-floating:  #2b2d31;
+  --bg-hover:     #35363c;
+  --bg-active:    #404249;
+  --bg-modifier-selected: rgba(78, 80, 88, 0.6);
+  --border:       #1e1f22;
+  --interactive-normal: #b5bac1;
+  --interactive-hover:  #dbdee1;
+  --interactive-active: #ffffff;
+  --interactive-muted:  #4e5058;
+  --header-primary:   #f2f3f5;
+  --header-secondary: #b5bac1;
+  --text-normal:  #dbdee1;
+  --text-muted:   #949ba4;
+  --text-link:    #00a8fc;
+  --brand:        #5865f2;
+  --brand-hover:  #4752c4;
+  --green:        #23a55a;
+  --yellow:       #f0b232;
+  --red:          #f23f43;
+  --grey:         #80848e;
+  /* legacy aliases used in template */
+  --bg-darker: var(--bg-tertiary);
+  --bg-dark:   var(--bg-secondary);
+  --bg:        var(--bg-secondary);
+  --bg-elev:   var(--bg-primary);
+  --text:      var(--header-primary);
+  --muted:     var(--header-secondary);
+  --dim:       var(--text-muted);
+  --accent:    var(--brand);
+  --accent-h:  var(--brand-hover);
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; background: var(--bg-elev); color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  font-size: 15px; line-height: 1.45; -webkit-font-smoothing: antialiased;
+html, body { margin: 0; padding: 0; height: 100%; background: var(--bg-primary); color: var(--text-normal);
+  font-family: 'Inter', 'gg sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  font-size: 14px; line-height: 1.4; -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility; }
+@supports (font-variation-settings: normal) {
+  html, body { font-family: 'Inter var', 'gg sans', -apple-system, BlinkMacSystemFont, sans-serif; }
+}
 a { color: inherit; text-decoration: none; }
 button, select, input { font-family: inherit; font-size: 14px; color: var(--text); }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
