@@ -1,15 +1,18 @@
 """Parsewave Activity Tracker — Discord-styled dashboard for tracking dev/reviewer activity."""
 import asyncio
 import datetime as dt
+import hmac
 import os
+import secrets
 import sqlite3
 import sys
 import threading
 from collections import defaultdict
 from html import escape
+from pathlib import Path
 
 import discord
-from flask import Flask, abort, jsonify, render_template_string, request
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
 
 # ---------- config ----------
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -819,6 +822,97 @@ def voice_overview(days=7, role_id=None):
 # ---------- Flask ----------
 app = Flask(__name__)
 
+# session secret — generate once and persist to disk so cookies survive restarts
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+_secret_file = Path(".session_secret")
+if _secret_file.exists():
+    app.secret_key = _secret_file.read_text().strip()
+else:
+    app.secret_key = secrets.token_urlsafe(32)
+    _secret_file.write_text(app.secret_key)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=30)
+
+
+PUBLIC_ENDPOINTS = {"login", "logout", "health", "static"}
+
+
+@app.before_request
+def require_login():
+    # auth disabled when no password configured
+    if not DASHBOARD_PASSWORD:
+        return
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return
+    if session.get("authed"):
+        return
+    nxt = request.full_path if request.method == "GET" else "/"
+    return redirect(url_for("login", next=nxt))
+
+
+LOGIN_TEMPLATE = """
+<!doctype html><html><head><meta charset="utf-8"><title>Sign in · Parsewave Tracker</title>
+<style>
+@import url('https://rsms.me/inter/inter.css');
+body { background: #1e1f22; color: #f2f3f5; font-family: 'Inter', system-ui, sans-serif;
+  margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.card { background: #2b2d31; border: 1px solid #1e1f22; border-radius: 12px; padding: 32px;
+  width: 100%; max-width: 380px; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.logo { width: 56px; height: 56px; border-radius: 18px; background: #5865f2; color: #fff;
+  display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 24px;
+  margin: 0 auto 14px; }
+h1 { margin: 0 0 4px; text-align: center; font-size: 20px; }
+.sub { text-align: center; color: #b5bac1; font-size: 14px; margin-bottom: 22px; }
+label { display: block; color: #b5bac1; font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; margin-bottom: 6px; }
+input[type=password] { width: 100%; padding: 11px 12px; background: #1e1f22; color: #f2f3f5;
+  border: 1px solid #1e1f22; border-radius: 6px; font-size: 15px; outline: none; }
+input[type=password]:focus { border-color: #5865f2; }
+button { width: 100%; margin-top: 16px; padding: 11px; background: #5865f2; color: #fff;
+  border: 0; border-radius: 6px; font-weight: 600; font-size: 15px; cursor: pointer; }
+button:hover { background: #4752c4; }
+.err { background: rgba(242,63,67,.18); color: #ff5b5e; padding: 8px 12px; border-radius: 6px;
+  font-size: 13px; margin-bottom: 14px; }
+</style></head><body>
+<div class="card">
+  <div class="logo">P</div>
+  <h1>Parsewave Tracker</h1>
+  <div class="sub">Sign in to view the dashboard</div>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body></html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not DASHBOARD_PASSWORD:
+        return redirect("/")
+    error = None
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if hmac.compare_digest(pw, DASHBOARD_PASSWORD):
+            session["authed"] = True
+            session.permanent = True
+            nxt = request.args.get("next") or "/"
+            if not nxt.startswith("/"):
+                nxt = "/"
+            return redirect(nxt)
+        error = "Wrong password"
+    return render_template_string(LOGIN_TEMPLATE, error=error), (401 if error else 200)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 CSS = """
 @import url('https://rsms.me/inter/inter.css');
 :root {
@@ -1082,6 +1176,9 @@ LAYOUT = """
           <span class="count">{{ r.cnt }}</span>
         </a>
         {% endfor %}
+      </div>
+      <div class="nav-section" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+        <a class="nav-item" href="/logout"><span class="icon">🚪</span><span class="label">Sign out</span></a>
       </div>
     </div>
   </aside>

@@ -20,6 +20,9 @@ venv/
 cloudflared
 gh
 
+# Auth
+.session_secret
+
 # OS
 .DS_Store
 Thumbs.db
