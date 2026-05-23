@@ -218,6 +218,9 @@ async def on_ready():
           f"{len(guild.roles)} roles, {len(guild.channels)} channels in '{guild.name}'.")
     if BACKFILL_DAYS > 0:
         client.loop.create_task(backfill(guild, BACKFILL_DAYS))
+    if not getattr(client, "_voice_resync_started", False):
+        client._voice_resync_started = True
+        client.loop.create_task(periodic_voice_resync())
 
 
 @client.event
@@ -287,6 +290,40 @@ async def on_member_update(before, after):
                 if r.is_default():
                     continue
                 c.execute("INSERT OR IGNORE INTO member_roles (user_id, role_id) VALUES (?, ?)", (after.id, r.id))
+
+
+async def periodic_voice_resync():
+    """Every 5 minutes, reconcile DB open voice sessions with the bot's gateway view.
+    Catches any drift from missed events, brief disconnects, etc."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            guild = client.get_guild(GUILD_ID)
+            if guild is not None:
+                now = now_iso()
+                live = {(m.id, ch.id) for ch in guild.voice_channels for m in ch.members if not m.bot}
+                with db() as c:
+                    open_rows = c.execute(
+                        "SELECT id, user_id, channel_id FROM voice_sessions WHERE left_at IS NULL"
+                    ).fetchall()
+                    open_keys = {(r[1], r[2]): r[0] for r in open_rows}
+                    for key, vs_id in open_keys.items():
+                        if key not in live:
+                            c.execute(
+                                """UPDATE voice_sessions SET left_at = ?,
+                                   duration_sec = CAST((julianday(?) - julianday(joined_at)) * 86400 AS INTEGER)
+                                   WHERE id = ?""",
+                                (now, now, vs_id),
+                            )
+                    for key in live - set(open_keys.keys()):
+                        uid, cid = key
+                        c.execute(
+                            "INSERT INTO voice_sessions (user_id, channel_id, joined_at) VALUES (?,?,?)",
+                            (uid, cid, now),
+                        )
+        except Exception as e:
+            print(f"[voice-resync] error: {e!r}")
+        await asyncio.sleep(300)
 
 
 @client.event
@@ -373,6 +410,56 @@ def color_to_hex(c):
 
 
 # ---------- data ----------
+def build_sleep_grid(user_ids, days=7):
+    """For each user, return per-day list: {day, day_label, max_gap_h, slept, has_events}.
+    Day = calendar UTC day. Slept = max gap of inactivity within that day >= 8h."""
+    if not user_ids:
+        return {}
+    now = dt.datetime.now(dt.timezone.utc)
+    earliest = (now - dt.timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    placeholders = ",".join("?" * len(user_ids))
+    with db() as c:
+        rows = c.execute(
+            f"""SELECT user_id, ts FROM (
+                  SELECT author_id AS user_id, created_at AS ts FROM messages
+                    WHERE created_at >= ? AND author_id IN ({placeholders})
+                  UNION ALL
+                  SELECT user_id, joined_at AS ts FROM voice_sessions
+                    WHERE joined_at >= ? AND user_id IN ({placeholders})
+                ) ORDER BY user_id, ts""",
+            [earliest.isoformat(), *user_ids, earliest.isoformat(), *user_ids]
+        ).fetchall()
+    by_user = defaultdict(list)
+    for r in rows:
+        ts = parse_iso(r[1])
+        if ts:
+            by_user[r[0]].append(ts)
+    result = {}
+    for uid in user_ids:
+        events = by_user.get(uid, [])
+        grid = []
+        for d in range(days - 1, -1, -1):
+            day_start = (now - dt.timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + dt.timedelta(days=1)
+            window_end = min(day_end, now)
+            in_day = [e for e in events if day_start <= e < day_end]
+            moments = [day_start] + in_day + [window_end]
+            max_gap_h = 0
+            for i in range(1, len(moments)):
+                g = (moments[i] - moments[i - 1]).total_seconds() / 3600
+                if g > max_gap_h:
+                    max_gap_h = g
+            grid.append({
+                "day": day_start.strftime("%Y-%m-%d"),
+                "day_label": day_start.strftime("%a"),
+                "max_gap_h": round(max_gap_h, 1),
+                "slept": max_gap_h >= 8,
+                "has_events": len(in_day) > 0,
+            })
+        result[uid] = grid
+    return result
+
+
 def build_data(days, role_id, channel_id, search):
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = (now - dt.timedelta(days=days)).isoformat()
@@ -475,6 +562,12 @@ def build_data(days, role_id, channel_id, search):
             spark_raw[r["author_id"]][r["day"]] = r["cnt"]
         days_list = [(now - dt.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
 
+    # who is currently in voice (for badge)
+    with db() as c2:
+        live_voice_set = {row[0] for row in c2.execute(
+            "SELECT user_id FROM voice_sessions WHERE left_at IS NULL"
+        ).fetchall()}
+
     cutoff_dt = parse_iso(last24h)
     rows = []
     for m in members:
@@ -513,7 +606,7 @@ def build_data(days, role_id, channel_id, search):
 
         pres_label, pres_class = presence_status(last_at)
 
-        score = cnt + voice_min / 10.0
+        score = cnt + voice_min  # voice and messages weighted equally
         top_role = (roles_by_user.get(uid) or [{"name": None, "color": "#b5bac1"}])[0]
 
         rows.append({
@@ -538,6 +631,7 @@ def build_data(days, role_id, channel_id, search):
             "is_active": cnt > 0 or voice_min > 0,
             "working_now": cnt_8h > 0,
             "took_break": max_gap_h >= 8,
+            "in_vc_now": uid in live_voice_set,
             "top_channel_name": top_ch_name,
             "top_channel_pct": top_ch_pct,
             "spark": spark,
@@ -941,7 +1035,7 @@ LAYOUT = """
         <a class="nav-item {% if show == 'working' %}active{% endif %}"  href="/members?days={{ days }}&show=working"><span class="icon">💼</span><span class="label">Working (8h)</span> <span class="count">{{ counts.working }}</span></a>
         <a class="nav-item {% if show == 'active' %}active{% endif %}"   href="/members?days={{ days }}&show=active"><span class="icon">🟢</span><span class="label">Active in window</span> <span class="count">{{ counts.active }}</span></a>
         <a class="nav-item {% if route == 'voice' %}active{% endif %}" href="/voice?days={{ days }}"><span class="icon">🎙</span><span class="label">Voice channels</span> <span class="count">{{ counts.voice_live }}</span></a>
-        <a class="nav-item {% if show == 'nosleep' %}active{% endif %}"  href="/members?days={{ days }}&show=nosleep"><span class="icon">⚠️</span><span class="label">No 8h break</span> <span class="count">{{ counts.no_break }}</span></a>
+        <a class="nav-item {% if route == 'sleep' %}active{% endif %}" href="/sleep"><span class="icon">💤</span><span class="label">Sleep tracker</span> <span class="count">{{ counts.no_break }}</span></a>
         <a class="nav-item {% if show == 'inactive' %}active{% endif %}" href="/members?days={{ days }}&show=inactive"><span class="icon">💤</span><span class="label">Inactive in window</span> <span class="count">{{ counts.inactive }}</span></a>
       </div>
       <div class="nav-section">
@@ -1060,7 +1154,7 @@ INDEX_BODY = """
               <span class="status {{ r.presence_class }}"></span>
             </span>
             <div>
-              <div class="member-name">{{ r.name }}</div>
+              <div class="member-name">{{ r.name }}{% if r.in_vc_now %} <span class="flag ok" style="margin-left:4px;font-size:10px;">🔊 LIVE</span>{% endif %}</div>
               <div class="member-handle">{{ r.username }}</div>
             </div>
           </div>
@@ -1069,7 +1163,7 @@ INDEX_BODY = """
         <td class="num">{{ r.msg_count }}</td>
         <td class="num">{{ r.msg_24h }}</td>
         <td class="num">{{ r.msg_8h }}</td>
-        <td class="num">{{ r.voice_min }}</td>
+        <td class="num">{{ r.voice_min }}{% if r.in_vc_now %} <span style="color:var(--green);font-size:10px;">●</span>{% endif %}</td>
         <td>
           <span class="spark">
           {% for v in r.spark %}
@@ -1141,6 +1235,26 @@ MEMBER_BODY = """
     <div class="day-row">
       {% for d in m.daily %}
       <div class="col label" style="font-size:10px;color:var(--dim);text-align:center;">{% if loop.index0 % 5 == 0 %}{{ d.day[5:] }}{% endif %}</div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Sleep last 7 days <span style="color:var(--dim);font-weight:500;text-transform:none;">— green = 8h+ break, red = none, grey = no activity</span></h2>
+    <div style="display:flex;gap:10px;align-items:center;">
+      {% for d in m.sleep_grid %}
+      <div style="text-align:center;">
+        <div style="color:var(--dim);font-size:11px;font-weight:600;">{{ d.day_label }}</div>
+        <div style="color:var(--dim);font-size:10px;margin-bottom:4px;">{{ d.day[5:] }}</div>
+        {% if not d.has_events %}
+        <span title="{{ d.max_gap_h }}h gap (no activity)" style="display:inline-block;width:34px;height:34px;border-radius:50%;background:#4e5058;"></span>
+        {% elif d.slept %}
+        <span title="{{ d.max_gap_h }}h gap (slept)" style="display:inline-block;width:34px;height:34px;border-radius:50%;background:var(--green);"></span>
+        {% else %}
+        <span title="{{ d.max_gap_h }}h gap (no 8h break)" style="display:inline-block;width:34px;height:34px;border-radius:50%;background:var(--red);"></span>
+        {% endif %}
+        <div style="font-size:10px;color:var(--muted);margin-top:4px;">{{ d.max_gap_h }}h</div>
+      </div>
       {% endfor %}
     </div>
   </div>
@@ -1276,6 +1390,62 @@ HOME_BODY = """
           {% elif r.is_active %}<span class="flag warn">recent</span>
           {% else %}<span class="flag bad">idle</span>{% endif %}
         </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+SLEEP_BODY = """
+<div class="topbar">
+  <h1>💤 Sleep tracker</h1>
+  <span class="subtitle">8-hour break detection — last 7 days</span>
+  <span class="spacer"></span>
+</div>
+<div class="content">
+  <div class="stats">
+    <div class="stat green"><div class="v">{{ stats.slept_last_night }}</div><div class="l">slept last night</div></div>
+    <div class="stat red"><div class="v">{{ stats.no_sleep_last_night }}</div><div class="l">didn't sleep last night</div></div>
+    <div class="stat"><div class="v">{{ stats.gray_last_night }}</div><div class="l">no activity last night</div></div>
+    <div class="stat red"><div class="v">{{ stats.no_sleep_3_plus }}</div><div class="l">3+ days no break</div></div>
+    <div class="stat"><div class="v">{{ stats.perfect_week }}</div><div class="l">slept all 7 days</div></div>
+  </div>
+
+  <div class="section-title">Sleep grid · last 7 days</div>
+  <div class="panel">
+    <div class="panel-header">Green = had 8h+ gap (slept) · Red = no 8h gap (concerning) · Grey = no activity that day</div>
+    <table class="members">
+      <thead><tr>
+        <th>Member</th>
+        {% for d in day_headers %}<th class="num" style="font-variant-numeric:normal;">{{ d.label }}<br><span style="color:var(--dim);font-weight:400;font-size:10px;">{{ d.date }}</span></th>{% endfor %}
+        <th class="num">Slept</th>
+        <th class="num">Missed</th>
+      </tr></thead>
+      <tbody>
+      {% for row in rows %}
+      <tr onclick="location='/member/{{ row.user_id }}'">
+        <td>
+          <div class="member-cell">
+            <span class="avatar">{% if row.avatar %}<img src="{{ row.avatar }}" alt="">{% else %}{{ row.initial }}{% endif %}</span>
+            <div><div class="member-name">{{ row.name }}</div><div class="member-handle">{{ row.username }}</div></div>
+          </div>
+        </td>
+        {% for d in row.grid %}
+        <td class="num">
+          {% if not d.has_events %}
+            <span title="No activity ({{ d.max_gap_h }}h gap)" style="display:inline-block;width:24px;height:24px;border-radius:50%;background:#4e5058;"></span>
+          {% elif d.slept %}
+            <span title="Slept ({{ d.max_gap_h }}h gap)" style="display:inline-block;width:24px;height:24px;border-radius:50%;background:var(--green);box-shadow:0 0 0 2px rgba(35,165,90,.15);"></span>
+          {% else %}
+            <span title="No 8h break — only {{ d.max_gap_h }}h gap" style="display:inline-block;width:24px;height:24px;border-radius:50%;background:var(--red);box-shadow:0 0 0 2px rgba(242,63,67,.15);"></span>
+          {% endif %}
+        </td>
+        {% endfor %}
+        <td class="num"><span class="flag ok">{{ row.slept_count }}</span></td>
+        <td class="num">{% if row.missed_count > 0 %}<span class="flag bad">{{ row.missed_count }}</span>{% else %}<span class="member-handle">0</span>{% endif %}</td>
       </tr>
       {% endfor %}
       </tbody>
@@ -1613,6 +1783,8 @@ def member(user_id):
 
     pres_label, pres_class = presence_status(last_at)
 
+    sleep_grid_one = build_sleep_grid([user_id], days=7).get(user_id, [])
+
     m = {
         "name": mem["display_name"] or mem["name"],
         "username": mem["name"],
@@ -1633,6 +1805,7 @@ def member(user_id):
         "top_channels": top_channels,
         "voice_sessions": voice_sessions,
         "recent_msgs": recent_msgs,
+        "sleep_grid": sleep_grid_one,
     }
 
     counts = compute_counts(build_data(days, None, None, ""), len(voice_now),
@@ -1642,6 +1815,81 @@ def member(user_id):
         LAYOUT,
         body=body, css=CSS, sidebar=sidebar, days=days, role_id=None, channel_id=None,
         show="all", counts=counts, page_title=m["name"], route="member",
+    )
+
+
+@app.route("/sleep")
+def sleep_page():
+    days = 7
+    sidebar = sidebar_data()
+    voice_now = live_voice()
+    full_rows = build_data(days, None, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+
+    # Only show members with any activity in last 7d
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        active_uids = [r["uid"] for r in c.execute("""
+            SELECT user_id AS uid FROM (
+              SELECT author_id AS user_id FROM messages
+                WHERE created_at >= datetime('now', '-7 days')
+              UNION
+              SELECT user_id FROM voice_sessions
+                WHERE joined_at >= datetime('now', '-7 days')
+            )
+        """).fetchall()]
+        member_info = {r["user_id"]: dict(r) for r in c.execute(f"""
+            SELECT user_id, name, display_name, avatar_url FROM members
+            WHERE is_bot = 0 AND left_at IS NULL AND user_id IN ({",".join("?" * len(active_uids)) or "NULL"})
+        """, active_uids).fetchall()} if active_uids else {}
+
+    grid_by_user = build_sleep_grid(active_uids, days=7)
+    day_headers = []
+    if active_uids:
+        first_uid = next(iter(grid_by_user.keys()), None)
+        if first_uid:
+            day_headers = [{"label": d["day_label"], "date": d["day"][5:]} for d in grid_by_user[first_uid]]
+
+    rows = []
+    for uid, grid in grid_by_user.items():
+        info = member_info.get(uid)
+        if not info:
+            continue
+        slept = sum(1 for d in grid if d["slept"])
+        missed = sum(1 for d in grid if not d["slept"] and d["has_events"])
+        # longest run of consecutive "no sleep" days at the end
+        run = 0
+        for d in reversed(grid):
+            if d["has_events"] and not d["slept"]:
+                run += 1
+            else:
+                break
+        rows.append({
+            "user_id": uid,
+            "name": info["display_name"] or info["name"],
+            "username": info["name"],
+            "avatar": info["avatar_url"],
+            "initial": (info["display_name"] or info["name"] or "?")[0].upper(),
+            "grid": grid,
+            "slept_count": slept,
+            "missed_count": missed,
+            "current_no_sleep_run": run,
+        })
+    # Sort by current no-sleep run desc, then missed_count desc
+    rows.sort(key=lambda r: (-r["current_no_sleep_run"], -r["missed_count"], r["name"].lower()))
+
+    stats = {
+        "slept_last_night":   sum(1 for r in rows if r["grid"][-1]["slept"]),
+        "no_sleep_last_night": sum(1 for r in rows if r["grid"][-1]["has_events"] and not r["grid"][-1]["slept"]),
+        "gray_last_night":    sum(1 for r in rows if not r["grid"][-1]["has_events"]),
+        "no_sleep_3_plus":    sum(1 for r in rows if r["current_no_sleep_run"] >= 3),
+        "perfect_week":       sum(1 for r in rows if r["slept_count"] == 7),
+    }
+
+    body = render_template_string(SLEEP_BODY, rows=rows, day_headers=day_headers, stats=stats)
+    return render_template_string(
+        LAYOUT, body=body, css=CSS, sidebar=sidebar, days=days, role_id=None,
+        channel_id=None, show="all", counts=counts, page_title="Sleep tracker", route="sleep",
     )
 
 
