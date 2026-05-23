@@ -291,10 +291,18 @@ async def on_member_update(before, after):
 
 @client.event
 async def on_voice_state_update(member, before, after):
-    if member.guild.id != GUILD_ID:
+    if member.guild.id != GUILD_ID or member.bot:
         return
     now = now_iso()
     with db() as c:
+        # ensure member exists with up-to-date info
+        c.execute("""INSERT INTO members (user_id, name, display_name, avatar_url, is_bot)
+                     VALUES (?, ?, ?, ?, 0)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                       name=excluded.name, display_name=excluded.display_name,
+                       avatar_url=excluded.avatar_url""",
+                  (member.id, str(member), member.display_name,
+                   str(member.display_avatar.url) if member.display_avatar else None))
         if before.channel is None and after.channel is not None:
             c.execute("INSERT INTO voice_sessions (user_id, channel_id, joined_at) VALUES (?,?,?)",
                       (member.id, after.channel.id, now))
@@ -630,11 +638,63 @@ def live_voice():
                    m.name, m.display_name, m.avatar_url,
                    ch.name AS channel_name
             FROM voice_sessions vs
-            JOIN members m ON m.user_id = vs.user_id
+            JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
             LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
             WHERE vs.left_at IS NULL
             ORDER BY vs.joined_at
         """).fetchall()]
+
+
+def voice_overview(days=7):
+    """Live VC state grouped by channel + per-channel stats over window."""
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        live = c.execute("""
+            SELECT vs.user_id, vs.channel_id, vs.joined_at,
+                   m.name, m.display_name, m.avatar_url,
+                   ch.name AS channel_name
+            FROM voice_sessions vs
+            JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
+            LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+            WHERE vs.left_at IS NULL
+            ORDER BY vs.joined_at
+        """).fetchall()
+        per_channel_stats = c.execute("""
+            SELECT vs.channel_id, ch.name,
+                   COUNT(*) AS session_cnt,
+                   COUNT(DISTINCT vs.user_id) AS unique_users,
+                   SUM(COALESCE(vs.duration_sec,
+                       CAST((julianday('now') - julianday(vs.joined_at)) * 86400 AS INTEGER))
+                   ) AS total_sec
+            FROM voice_sessions vs
+            LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+            WHERE vs.joined_at >= ?
+            GROUP BY vs.channel_id
+            ORDER BY total_sec DESC
+        """, (cutoff,)).fetchall()
+        top_voice_users = c.execute("""
+            SELECT vs.user_id, m.name, m.display_name, m.avatar_url,
+                   COUNT(*) AS sessions,
+                   SUM(COALESCE(vs.duration_sec,
+                       CAST((julianday('now') - julianday(vs.joined_at)) * 86400 AS INTEGER))
+                   ) AS total_sec
+            FROM voice_sessions vs
+            JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
+            WHERE vs.joined_at >= ?
+            GROUP BY vs.user_id
+            ORDER BY total_sec DESC
+            LIMIT 20
+        """, (cutoff,)).fetchall()
+    live_by_channel = defaultdict(list)
+    for r in live:
+        live_by_channel[r["channel_id"]].append(dict(r))
+    return {
+        "live_by_channel": {k: v for k, v in live_by_channel.items()},
+        "per_channel_stats": [dict(r) for r in per_channel_stats],
+        "top_voice_users": [dict(r) for r in top_voice_users],
+        "live_count": len(live),
+    }
 
 
 # ---------- Flask ----------
@@ -880,7 +940,7 @@ LAYOUT = """
         <a class="nav-item {% if route == 'members' and not role_id and show == 'all' %}active{% endif %}" href="/members?days={{ days }}"><span class="icon">👥</span><span class="label">All members</span> <span class="count">{{ sidebar.meta.total_members }}</span></a>
         <a class="nav-item {% if show == 'working' %}active{% endif %}"  href="/members?days={{ days }}&show=working"><span class="icon">💼</span><span class="label">Working (8h)</span> <span class="count">{{ counts.working }}</span></a>
         <a class="nav-item {% if show == 'active' %}active{% endif %}"   href="/members?days={{ days }}&show=active"><span class="icon">🟢</span><span class="label">Active in window</span> <span class="count">{{ counts.active }}</span></a>
-        <a class="nav-item {% if show == 'voice' %}active{% endif %}"    href="/members?days={{ days }}&show=voice"><span class="icon">🎙</span><span class="label">In voice now</span> <span class="count">{{ counts.voice_live }}</span></a>
+        <a class="nav-item {% if route == 'voice' %}active{% endif %}" href="/voice?days={{ days }}"><span class="icon">🎙</span><span class="label">Voice channels</span> <span class="count">{{ counts.voice_live }}</span></a>
         <a class="nav-item {% if show == 'nosleep' %}active{% endif %}"  href="/members?days={{ days }}&show=nosleep"><span class="icon">⚠️</span><span class="label">No 8h break</span> <span class="count">{{ counts.no_break }}</span></a>
         <a class="nav-item {% if show == 'inactive' %}active{% endif %}" href="/members?days={{ days }}&show=inactive"><span class="icon">💤</span><span class="label">Inactive in window</span> <span class="count">{{ counts.inactive }}</span></a>
       </div>
@@ -1225,6 +1285,95 @@ HOME_BODY = """
 """
 
 
+VOICE_BODY = """
+<div class="topbar">
+  <h1>🎙 Voice channels</h1>
+  <span class="subtitle">{{ live_count }} in voice now · stats over last {{ days }}d</span>
+  <span class="spacer"></span>
+  <form method="get" style="display:flex;gap:8px;align-items:center;">
+    <select name="days" onchange="this.form.submit()">
+      {% for d in [1,3,7,14,30,60] %}
+      <option value="{{ d }}" {% if d == days %}selected{% endif %}>{{ d }}d</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="content">
+  <div class="section-title"><span class="live"></span>Live in voice · {{ live_count }} {% if live_count != 1 %}people{% else %}person{% endif %}</div>
+  {% if live_by_channel %}
+  <div class="proj-grid">
+    {% for ch_id, members in live_by_channel.items() %}
+    <div class="proj-card">
+      <div class="name">🔊 {{ (members[0].channel_name if members else '?') }}</div>
+      <div class="meta"><span class="pill">{{ members|length }} in</span></div>
+      <div class="contribs">
+        {% for v in members %}
+        <a class="contrib-row" href="/member/{{ v.user_id }}">
+          <span class="avatar">{% if v.avatar_url %}<img src="{{ v.avatar_url }}" alt="">{% else %}{{ (v.display_name or v.name)[0]|upper }}{% endif %}<span class="status online"></span></span>
+          <span class="name">{{ v.display_name or v.name }}</span>
+          <span class="cnt">{{ v.joined_at | humanize }}</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty"><h3>Nobody is in voice right now.</h3><div>Live state populates the moment anyone joins a voice channel.</div></div>
+  {% endif %}
+
+  <div class="section-title">Voice channel activity · {{ days }}d</div>
+  <div class="panel">
+    <div class="panel-header">By total voice time</div>
+    {% if per_channel_stats %}
+    <table class="members">
+      <thead><tr><th>Channel</th><th class="num">Sessions</th><th class="num">Unique users</th><th class="num">Total time</th></tr></thead>
+      <tbody>
+      {% for ch in per_channel_stats %}
+      <tr>
+        <td><span class="chip">🔊 {{ ch.name or '?' }}</span></td>
+        <td class="num">{{ ch.session_cnt }}</td>
+        <td class="num">{{ ch.unique_users }}</td>
+        <td class="num">{{ (ch.total_sec // 60) if ch.total_sec else 0 }} min</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No voice activity in window yet.</div>
+    {% endif %}
+  </div>
+
+  <div class="section-title" style="margin-top:24px;">Top voice users · {{ days }}d</div>
+  <div class="panel">
+    <div class="panel-header">By total voice time <a href="/members?days={{ days }}&sort=voice">See full table →</a></div>
+    {% if top_voice_users %}
+    <table class="members">
+      <thead><tr><th>Member</th><th class="num">Sessions</th><th class="num">Total minutes</th></tr></thead>
+      <tbody>
+      {% for u in top_voice_users %}
+      <tr onclick="location='/member/{{ u.user_id }}'">
+        <td>
+          <div class="member-cell">
+            <span class="avatar">{% if u.avatar_url %}<img src="{{ u.avatar_url }}" alt="">{% else %}{{ (u.display_name or u.name)[0]|upper }}{% endif %}</span>
+            <div><div class="member-name">{{ u.display_name or u.name }}</div><div class="member-handle">{{ u.name }}</div></div>
+          </div>
+        </td>
+        <td class="num">{{ u.sessions }}</td>
+        <td class="num">{{ (u.total_sec // 60) if u.total_sec else 0 }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No voice activity in window yet.</div>
+    {% endif %}
+  </div>
+</div>
+"""
+
+
 app.jinja_env.filters["humanize"] = humanize
 
 
@@ -1496,6 +1645,32 @@ def member(user_id):
     )
 
 
+@app.route("/voice")
+def voice_page():
+    try:
+        days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
+    except ValueError:
+        days = WINDOW_DAYS
+    sidebar = sidebar_data()
+    voice_now = live_voice()
+    full_rows = build_data(days, None, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    overview = voice_overview(days)
+    body = render_template_string(
+        VOICE_BODY,
+        days=days, live_count=overview["live_count"],
+        live_by_channel=overview["live_by_channel"],
+        per_channel_stats=overview["per_channel_stats"],
+        top_voice_users=overview["top_voice_users"],
+    )
+    return render_template_string(
+        LAYOUT,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=None,
+        channel_id=None, show="all", counts=counts, page_title="Voice channels",
+        route="voice",
+    )
+
+
 @app.route("/health")
 def health():
     with db() as c:
@@ -1513,6 +1688,72 @@ def rebackfill():
         return {"ok": False, "error": "guild not available"}, 503
     asyncio.run_coroutine_threadsafe(backfill(guild, days), client.loop)
     return {"ok": True, "queued": True, "days": days}
+
+
+@app.route("/admin/probe-voice")
+def probe_voice():
+    guild = client.get_guild(GUILD_ID) if client.is_ready() else None
+    if not guild:
+        return {"ok": False, "error": "guild not available"}, 503
+    live = []
+    total_in_vc = 0
+    for ch in guild.voice_channels:
+        members = [{"user_id": m.id, "name": str(m), "display_name": m.display_name,
+                    "self_mute": m.voice.self_mute if m.voice else None,
+                    "self_deaf": m.voice.self_deaf if m.voice else None,
+                    "streaming": m.voice.self_stream if m.voice else None,
+                    "video": m.voice.self_video if m.voice else None}
+                   for m in ch.members if not m.bot]
+        if members:
+            total_in_vc += len(members)
+        live.append({"channel_id": ch.id, "channel_name": ch.name,
+                     "user_limit": ch.user_limit, "members": members})
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        db_open = [dict(r) for r in c.execute("""
+            SELECT vs.user_id, vs.channel_id, vs.joined_at, ch.name AS channel_name, m.name AS user_name
+            FROM voice_sessions vs
+            LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+            LEFT JOIN members m ON m.user_id = vs.user_id
+            WHERE vs.left_at IS NULL
+        """).fetchall()]
+    return {
+        "ok": True,
+        "live_total": total_in_vc,
+        "db_open_total": len(db_open),
+        "live_by_channel": live,
+        "db_open_sessions": db_open,
+    }
+
+
+@app.route("/admin/resync-voice")
+def resync_voice():
+    guild = client.get_guild(GUILD_ID) if client.is_ready() else None
+    if not guild:
+        return {"ok": False, "error": "guild not available"}, 503
+    now = now_iso()
+    closed = opened = 0
+    with db() as c:
+        closed = c.execute(
+            """UPDATE voice_sessions SET left_at = ?,
+               duration_sec = CAST((julianday(?) - julianday(joined_at)) * 86400 AS INTEGER)
+               WHERE left_at IS NULL""", (now, now)).rowcount
+        for ch in guild.voice_channels:
+            for m in ch.members:
+                if m.bot:
+                    continue
+                c.execute("INSERT INTO voice_sessions (user_id, channel_id, joined_at) VALUES (?,?,?)",
+                          (m.id, ch.id, now))
+                # ensure member row exists with avatar
+                c.execute("""INSERT INTO members (user_id, name, display_name, avatar_url, is_bot)
+                             VALUES (?, ?, ?, ?, 0)
+                             ON CONFLICT(user_id) DO UPDATE SET
+                               name=excluded.name, display_name=excluded.display_name,
+                               avatar_url=excluded.avatar_url""",
+                          (m.id, str(m), m.display_name,
+                           str(m.display_avatar.url) if m.display_avatar else None))
+                opened += 1
+    return {"ok": True, "closed": closed, "opened": opened}
 
 
 @app.route("/admin/probe-perms")
