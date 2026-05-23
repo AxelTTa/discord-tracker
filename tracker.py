@@ -683,12 +683,14 @@ def sidebar_data(project_window_days=7, project_n=12):
     }
 
 
-def top_projects_with_contributors(days=7, n=6):
+def top_projects_with_contributors(days=7, n=6, role_id=None):
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
     out = []
     with db() as c:
         c.row_factory = sqlite3.Row
-        rows = c.execute("""SELECT m.channel_id, ch.name, ch.category,
+        rids = role_user_ids(c, role_id)
+        frag, p = role_filter_sql(rids, "m.author_id")
+        rows = c.execute(f"""SELECT m.channel_id, ch.name, ch.category,
                                    COUNT(*) AS cnt,
                                    COUNT(DISTINCT m.author_id) AS author_cnt
                             FROM messages m
@@ -697,16 +699,18 @@ def top_projects_with_contributors(days=7, n=6):
                               AND ch.name NOT LIKE 'ticket-%'
                               AND ch.name NOT LIKE '%-comp'
                               AND ch.name NOT LIKE 'contributor-%'
+                              {frag}
                             GROUP BY m.channel_id
                             ORDER BY cnt DESC
-                            LIMIT ?""", (cutoff, n)).fetchall()
+                            LIMIT ?""", (cutoff, *p, n)).fetchall()
         for r in rows:
-            top = c.execute("""SELECT m.author_id, mb.name, mb.display_name, mb.avatar_url, COUNT(*) AS cnt
+            top = c.execute(f"""SELECT m.author_id, mb.name, mb.display_name, mb.avatar_url, COUNT(*) AS cnt
                                FROM messages m
                                JOIN members mb ON mb.user_id = m.author_id
                                WHERE m.channel_id = ? AND m.created_at >= ? AND mb.is_bot = 0
+                                 {frag}
                                GROUP BY m.author_id ORDER BY cnt DESC LIMIT 4""",
-                            (r["channel_id"], cutoff)).fetchall()
+                            (r["channel_id"], cutoff, *p)).fetchall()
             out.append({
                 "channel_id": r["channel_id"],
                 "name": r["name"],
@@ -724,37 +728,58 @@ def top_projects_with_contributors(days=7, n=6):
     return out
 
 
-def live_voice():
+def role_user_ids(c, role_id):
+    """Return list of user_ids with the given role (None = all)."""
+    if role_id is None:
+        return None
+    return [r[0] for r in c.execute(
+        "SELECT user_id FROM member_roles WHERE role_id = ?", (role_id,)
+    ).fetchall()]
+
+
+def role_filter_sql(role_ids, alias):
+    """Return (WHERE-fragment, params) to AND-restrict by role_ids. Empty if None."""
+    if role_ids is None:
+        return "", []
+    if not role_ids:
+        return f" AND {alias} IN (NULL) ", []
+    return f" AND {alias} IN ({','.join('?' * len(role_ids))}) ", list(role_ids)
+
+
+def live_voice(role_id=None):
     with db() as c:
         c.row_factory = sqlite3.Row
-        return [dict(r) for r in c.execute("""
+        rids = role_user_ids(c, role_id)
+        frag, params = role_filter_sql(rids, "vs.user_id")
+        return [dict(r) for r in c.execute(f"""
             SELECT vs.user_id, vs.channel_id, vs.joined_at,
                    m.name, m.display_name, m.avatar_url,
                    ch.name AS channel_name
             FROM voice_sessions vs
             JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
             LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
-            WHERE vs.left_at IS NULL
+            WHERE vs.left_at IS NULL {frag}
             ORDER BY vs.joined_at
-        """).fetchall()]
+        """, params).fetchall()]
 
 
-def voice_overview(days=7):
-    """Live VC state grouped by channel + per-channel stats over window."""
+def voice_overview(days=7, role_id=None):
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
     with db() as c:
         c.row_factory = sqlite3.Row
-        live = c.execute("""
+        rids = role_user_ids(c, role_id)
+        frag_vs, p_vs = role_filter_sql(rids, "vs.user_id")
+        live = c.execute(f"""
             SELECT vs.user_id, vs.channel_id, vs.joined_at,
                    m.name, m.display_name, m.avatar_url,
                    ch.name AS channel_name
             FROM voice_sessions vs
             JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
             LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
-            WHERE vs.left_at IS NULL
+            WHERE vs.left_at IS NULL {frag_vs}
             ORDER BY vs.joined_at
-        """).fetchall()
-        per_channel_stats = c.execute("""
+        """, p_vs).fetchall()
+        per_channel_stats = c.execute(f"""
             SELECT vs.channel_id, ch.name,
                    COUNT(*) AS session_cnt,
                    COUNT(DISTINCT vs.user_id) AS unique_users,
@@ -763,11 +788,11 @@ def voice_overview(days=7):
                    ) AS total_sec
             FROM voice_sessions vs
             LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
-            WHERE vs.joined_at >= ?
+            WHERE vs.joined_at >= ? {frag_vs}
             GROUP BY vs.channel_id
             ORDER BY total_sec DESC
-        """, (cutoff,)).fetchall()
-        top_voice_users = c.execute("""
+        """, [cutoff, *p_vs]).fetchall()
+        top_voice_users = c.execute(f"""
             SELECT vs.user_id, m.name, m.display_name, m.avatar_url,
                    COUNT(*) AS sessions,
                    SUM(COALESCE(vs.duration_sec,
@@ -775,11 +800,11 @@ def voice_overview(days=7):
                    ) AS total_sec
             FROM voice_sessions vs
             JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
-            WHERE vs.joined_at >= ?
+            WHERE vs.joined_at >= ? {frag_vs}
             GROUP BY vs.user_id
             ORDER BY total_sec DESC
             LIMIT 20
-        """, (cutoff,)).fetchall()
+        """, [cutoff, *p_vs]).fetchall()
     live_by_channel = defaultdict(list)
     for r in live:
         live_by_channel[r["channel_id"]].append(dict(r))
@@ -1028,20 +1053,22 @@ LAYOUT = """
       </div>
     </a>
     <div class="sidebar-scroll">
+      {% set rq = ('&role=' ~ role_id) if role_id else '' %}
       <div class="nav-section">
-        <div class="nav-section-title">Overview</div>
-        <a class="nav-item {% if route == 'home' %}active{% endif %}" href="/"><span class="icon">🏠</span><span class="label">Home</span></a>
-        <a class="nav-item {% if route == 'members' and not role_id and show == 'all' %}active{% endif %}" href="/members?days={{ days }}"><span class="icon">👥</span><span class="label">All members</span> <span class="count">{{ sidebar.meta.total_members }}</span></a>
-        <a class="nav-item {% if show == 'working' %}active{% endif %}"  href="/members?days={{ days }}&show=working"><span class="icon">💼</span><span class="label">Working (8h)</span> <span class="count">{{ counts.working }}</span></a>
-        <a class="nav-item {% if show == 'active' %}active{% endif %}"   href="/members?days={{ days }}&show=active"><span class="icon">🟢</span><span class="label">Active in window</span> <span class="count">{{ counts.active }}</span></a>
-        <a class="nav-item {% if route == 'voice' %}active{% endif %}" href="/voice?days={{ days }}"><span class="icon">🎙</span><span class="label">Voice channels</span> <span class="count">{{ counts.voice_live }}</span></a>
-        <a class="nav-item {% if route == 'sleep' %}active{% endif %}" href="/sleep"><span class="icon">💤</span><span class="label">Sleep tracker</span> <span class="count">{{ counts.no_break }}</span></a>
-        <a class="nav-item {% if show == 'inactive' %}active{% endif %}" href="/members?days={{ days }}&show=inactive"><span class="icon">💤</span><span class="label">Inactive in window</span> <span class="count">{{ counts.inactive }}</span></a>
+        <div class="nav-section-title">Overview {% if role_id %}— role-scoped{% endif %}</div>
+        <a class="nav-item {% if route == 'home' %}active{% endif %}" href="/?days={{ days }}{{ rq }}"><span class="icon">🏠</span><span class="label">Home</span></a>
+        <a class="nav-item {% if route == 'members' and show == 'all' %}active{% endif %}" href="/members?days={{ days }}{{ rq }}"><span class="icon">👥</span><span class="label">All members</span> <span class="count">{{ sidebar.meta.total_members if not role_id else (counts.active + counts.inactive) }}</span></a>
+        <a class="nav-item {% if show == 'working' %}active{% endif %}"  href="/members?days={{ days }}{{ rq }}&show=working"><span class="icon">💼</span><span class="label">Working (8h)</span> <span class="count">{{ counts.working }}</span></a>
+        <a class="nav-item {% if show == 'active' %}active{% endif %}"   href="/members?days={{ days }}{{ rq }}&show=active"><span class="icon">🟢</span><span class="label">Active in window</span> <span class="count">{{ counts.active }}</span></a>
+        <a class="nav-item {% if route == 'voice' %}active{% endif %}" href="/voice?days={{ days }}{{ rq }}"><span class="icon">🎙</span><span class="label">Voice channels</span> <span class="count">{{ counts.voice_live }}</span></a>
+        <a class="nav-item {% if route == 'sleep' %}active{% endif %}" href="/sleep{% if role_id %}?role={{ role_id }}{% endif %}"><span class="icon">💤</span><span class="label">Sleep tracker</span> <span class="count">{{ counts.no_break }}</span></a>
+        <a class="nav-item {% if show == 'inactive' %}active{% endif %}" href="/members?days={{ days }}{{ rq }}&show=inactive"><span class="icon">😴</span><span class="label">Inactive in window</span> <span class="count">{{ counts.inactive }}</span></a>
+        {% if role_id %}<a class="nav-item" href="/?days={{ days }}" style="color:var(--text-link);"><span class="icon">✕</span><span class="label">Clear role filter</span></a>{% endif %}
       </div>
       <div class="nav-section">
         <div class="nav-section-title">Projects</div>
         {% for p in sidebar.projects %}
-        <a class="nav-item {% if channel_id == p.channel_id %}active{% endif %}" href="/members?days={{ days }}&channel={{ p.channel_id }}" title="{{ p.category or '' }}">
+        <a class="nav-item {% if channel_id == p.channel_id %}active{% endif %}" href="/members?days={{ days }}{{ rq }}&channel={{ p.channel_id }}" title="{{ p.category or '' }}">
           <span class="hash">#</span><span class="label">{{ p.name }}</span><span class="count">{{ p.cnt }}</span>
         </a>
         {% endfor %}
@@ -1049,7 +1076,7 @@ LAYOUT = """
       <div class="nav-section">
         <div class="nav-section-title">Teams / Roles</div>
         {% for r in sidebar.roles %}
-        <a class="nav-item {% if role_id == r.role_id %}active{% endif %}" href="/members?days={{ days }}&role={{ r.role_id }}">
+        <a class="nav-item {% if role_id == r.role_id %}active{% endif %}" href="/?days={{ days }}&role={{ r.role_id }}">
           <span class="role-dot" style="background: {{ r.color if r.color and r.color != 0 else '#5865f2' }}"></span>
           <span class="label">{{ r.name }}</span>
           <span class="count">{{ r.cnt }}</span>
@@ -1306,7 +1333,7 @@ MEMBER_BODY = """
 HOME_BODY = """
 <div class="topbar">
   <h1>Overview</h1>
-  <span class="subtitle">{{ sidebar.meta.name }} · last {{ days }} day(s)</span>
+  <span class="subtitle">{{ sidebar.meta.name }} · last {{ days }} day(s){% if role_label %} · <span class="chip role-chip" style="margin-left:6px;"><span class="dot" style="background:#5865f2;"></span>{{ role_label }}</span>{% endif %}</span>
   <span class="spacer"></span>
   <form method="get" style="display:flex;gap:8px;align-items:center;">
     <select name="days" onchange="this.form.submit()">
@@ -1402,7 +1429,7 @@ HOME_BODY = """
 SLEEP_BODY = """
 <div class="topbar">
   <h1>💤 Sleep tracker</h1>
-  <span class="subtitle">8-hour break detection — last 7 days</span>
+  <span class="subtitle">8-hour break detection — last 7 days{% if role_label %} · <span class="chip role-chip" style="margin-left:6px;"><span class="dot" style="background:#5865f2;"></span>{{ role_label }}</span>{% endif %}</span>
   <span class="spacer"></span>
 </div>
 <div class="content">
@@ -1458,7 +1485,7 @@ SLEEP_BODY = """
 VOICE_BODY = """
 <div class="topbar">
   <h1>🎙 Voice channels</h1>
-  <span class="subtitle">{{ live_count }} in voice now · stats over last {{ days }}d</span>
+  <span class="subtitle">{{ live_count }} in voice now · stats over last {{ days }}d{% if role_label %} · <span class="chip role-chip" style="margin-left:6px;"><span class="dot" style="background:#5865f2;"></span>{{ role_label }}</span>{% endif %}</span>
   <span class="spacer"></span>
   <form method="get" style="display:flex;gap:8px;align-items:center;">
     <select name="days" onchange="this.form.submit()">
@@ -1569,27 +1596,35 @@ SORT_KEYS = {
 }
 
 
+def parse_role(req):
+    rid = req.args.get("role")
+    return int(rid) if rid and rid.isdigit() else None
+
+
 @app.route("/")
 def home():
     try:
         days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
     except ValueError:
         days = WINDOW_DAYS
+    role_id = parse_role(request)
     sidebar = sidebar_data()
-    voice_now = live_voice()
-    full_rows = build_data(days, None, None, "")
+    voice_now = live_voice(role_id=role_id)
+    full_rows = build_data(days, role_id, None, "")
     counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
-    projects = top_projects_with_contributors(days=days, n=6)
+    projects = top_projects_with_contributors(days=days, n=6, role_id=role_id)
     top_perf = sorted(full_rows, key=SORT_KEYS["score"])[:10]
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
 
     body = render_template_string(
         HOME_BODY,
         sidebar=sidebar, voice_now=voice_now, counts=counts,
         days=days, projects=projects, top_performers=top_perf,
+        role_id=role_id, role_label=role_label,
     )
     return render_template_string(
         LAYOUT,
-        body=body, css=CSS, sidebar=sidebar, days=days, role_id=None,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
         channel_id=None, show="all", counts=counts, page_title="Overview",
         route="home",
     )
@@ -1821,23 +1856,27 @@ def member(user_id):
 @app.route("/sleep")
 def sleep_page():
     days = 7
+    role_id = parse_role(request)
     sidebar = sidebar_data()
-    voice_now = live_voice()
-    full_rows = build_data(days, None, None, "")
+    voice_now = live_voice(role_id=role_id)
+    full_rows = build_data(days, role_id, None, "")
     counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
 
-    # Only show members with any activity in last 7d
+    # Only show members with any activity in last 7d (and matching role if any)
     with db() as c:
         c.row_factory = sqlite3.Row
-        active_uids = [r["uid"] for r in c.execute("""
+        rids = role_user_ids(c, role_id)
+        role_frag, role_p = role_filter_sql(rids, "user_id")
+        active_uids = [r["uid"] for r in c.execute(f"""
             SELECT user_id AS uid FROM (
               SELECT author_id AS user_id FROM messages
                 WHERE created_at >= datetime('now', '-7 days')
               UNION
               SELECT user_id FROM voice_sessions
                 WHERE joined_at >= datetime('now', '-7 days')
-            )
-        """).fetchall()]
+            ) WHERE 1=1 {role_frag}
+        """, role_p).fetchall()]
         member_info = {r["user_id"]: dict(r) for r in c.execute(f"""
             SELECT user_id, name, display_name, avatar_url FROM members
             WHERE is_bot = 0 AND left_at IS NULL AND user_id IN ({",".join("?" * len(active_uids)) or "NULL"})
@@ -1886,9 +1925,10 @@ def sleep_page():
         "perfect_week":       sum(1 for r in rows if r["slept_count"] == 7),
     }
 
-    body = render_template_string(SLEEP_BODY, rows=rows, day_headers=day_headers, stats=stats)
+    body = render_template_string(SLEEP_BODY, rows=rows, day_headers=day_headers, stats=stats,
+                                  role_label=role_label, role_id=role_id)
     return render_template_string(
-        LAYOUT, body=body, css=CSS, sidebar=sidebar, days=days, role_id=None,
+        LAYOUT, body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
         channel_id=None, show="all", counts=counts, page_title="Sleep tracker", route="sleep",
     )
 
@@ -1899,21 +1939,24 @@ def voice_page():
         days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
     except ValueError:
         days = WINDOW_DAYS
+    role_id = parse_role(request)
     sidebar = sidebar_data()
-    voice_now = live_voice()
-    full_rows = build_data(days, None, None, "")
+    voice_now = live_voice(role_id=role_id)
+    full_rows = build_data(days, role_id, None, "")
     counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
-    overview = voice_overview(days)
+    overview = voice_overview(days, role_id=role_id)
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
     body = render_template_string(
         VOICE_BODY,
         days=days, live_count=overview["live_count"],
         live_by_channel=overview["live_by_channel"],
         per_channel_stats=overview["per_channel_stats"],
         top_voice_users=overview["top_voice_users"],
+        role_label=role_label, role_id=role_id,
     )
     return render_template_string(
         LAYOUT,
-        body=body, css=CSS, sidebar=sidebar, days=days, role_id=None,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
         channel_id=None, show="all", counts=counts, page_title="Voice channels",
         route="voice",
     )
