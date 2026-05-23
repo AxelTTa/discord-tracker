@@ -1,0 +1,31 @@
+.env
+.env.*
+!.env.example
+
+# DB
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Binaries / downloads
+cloudflared
+gh
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
