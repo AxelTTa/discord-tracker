@@ -20,6 +20,8 @@ from flask import Flask, abort, jsonify, redirect, render_template_string, reque
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 DB = os.environ.get("DB_PATH", "tracker.db")
+TURSO_URL = os.environ.get("TURSO_URL", "")    # libsql://... — enables Turso embedded replica
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "60"))
 BACKFILL_CONCURRENCY = int(os.environ.get("BACKFILL_CONCURRENCY", "4"))
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))  # retention + max UI window
@@ -31,7 +33,34 @@ GUILD_ID = int(GUILD_ID)
 
 
 # ---------- DB ----------
+# Turso mode: when TURSO_DATABASE_URL is set, use libsql embedded replica.
+# The replica is a local SQLite file that syncs from Turso cloud.
+# All existing code (sqlite3 queries, the AI agent's bash queries) works
+# against the local replica file unchanged — zero downstream changes needed.
+_turso_conn = None
+
+def _init_turso():
+    global _turso_conn
+    try:
+        import libsql_experimental as libsql  # type: ignore
+        _turso_conn = libsql.connect(DB, sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
+        _turso_conn.sync()
+        print(f"[turso] Connected to {TURSO_URL} — embedded replica at {DB}")
+    except ImportError:
+        print("[turso] libsql_experimental not installed — falling back to local SQLite")
+    except Exception as e:
+        print(f"[turso] Connection failed ({e}) — falling back to local SQLite")
+
+
 def db():
+    if _turso_conn is not None:
+        # Sync latest from cloud before every write batch, then return the connection.
+        # libsql_experimental's Connection is context-manager compatible (commit on __exit__).
+        try:
+            _turso_conn.sync()
+        except Exception:
+            pass
+        return _turso_conn
     c = sqlite3.connect(DB, timeout=15)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
@@ -90,6 +119,9 @@ CREATE INDEX IF NOT EXISTS idx_vs_user ON voice_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_vs_joined ON voice_sessions(joined_at);
 CREATE INDEX IF NOT EXISTS idx_vs_open ON voice_sessions(left_at) WHERE left_at IS NULL;
 """
+
+if TURSO_URL and TURSO_TOKEN:
+    _init_turso()
 
 with db() as _c:
     _c.executescript(SCHEMA)
@@ -871,7 +903,7 @@ def run_agent_query(question: str) -> dict:
     try:
         result = subprocess.run(
             [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL, "--allowedTools", "Bash"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=180,
             cwd=str(_WORK_DIR), env=env,
         )
         elapsed = round((dt.datetime.now(dt.timezone.utc) - t0).total_seconds(), 1)
@@ -885,8 +917,8 @@ def run_agent_query(question: str) -> dict:
         return {"ok": True, "elapsed": elapsed, "model": CLAUDE_MODEL, "answer": answer}
 
     except subprocess.TimeoutExpired:
-        return {"ok": False, "elapsed": 120, "model": CLAUDE_MODEL,
-                "answer": "**Query timed out** (>120s). Try a more specific question."}
+        return {"ok": False, "elapsed": 180, "model": CLAUDE_MODEL,
+                "answer": "**Query timed out** (>180s). Try a more specific question."}
     except FileNotFoundError:
         return {"ok": False, "elapsed": 0, "model": CLAUDE_MODEL,
                 "answer": (

@@ -1,9 +1,12 @@
 """Parsewave Activity Tracker — dashboard (Vercel serverless). Reads from Turso cloud DB."""
 import datetime as dt
 import hmac
+import json
 import os
 import secrets
 import sqlite3
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from contextlib import contextmanager
 from html import escape
@@ -15,6 +18,9 @@ from flask import Flask, abort, jsonify, redirect, render_template_string, reque
 TURSO_URL = os.environ.get("TURSO_URL")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))
+# URL of the Railway bot service — used to proxy /ask AI queries (e.g. https://xxx.railway.app)
+RAILWAY_BOT_URL = (os.environ.get("RAILWAY_BOT_URL") or "").rstrip("/")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 
 # ---------- DB ----------
@@ -1944,6 +1950,58 @@ def voice_page():
         body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
         channel_id=None, show="all", counts=counts, page_title="Voice channels",
         route="voice",
+    )
+
+
+_ASK_EXAMPLES = [
+    "Who's lowest performing on multimodal this month?",
+    "Who has the most voice time this week?",
+    "Which project had the most activity yesterday?",
+    "Who hasn't taken an 8h break in the last 3 days?",
+    "Compare top contributors on long-horizon vs multimodal",
+    "Who joined the server most recently?",
+    "What are people talking about in tbench today?",
+    "Who's been most active overall in the last 7 days?",
+]
+
+
+@app.route("/ask", methods=["GET", "POST"])
+def ask():
+    sidebar = sidebar_data()
+    voice_now = live_voice()
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        question = (data.get("q") or "").strip()
+        if not question:
+            return jsonify({"error": "no question provided"}), 400
+        if len(question) > 600:
+            return jsonify({"error": "question too long (max 600 chars)"}), 400
+        if not RAILWAY_BOT_URL:
+            return jsonify({"error": "RAILWAY_BOT_URL not configured — set it in Vercel env vars."}), 503
+        payload = json.dumps({"q": question}).encode()
+        req = urllib.request.Request(
+            f"{RAILWAY_BOT_URL}/internal/ask",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=200) as resp:
+                return jsonify(json.loads(resp.read()))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")[:400]
+            return jsonify({"ok": False, "answer": f"**Bot API error {e.code}:** {body}"}), 502
+        except Exception as e:
+            return jsonify({"ok": False, "answer": f"**Proxy error:** `{e}`"}), 502
+
+    full_rows = build_data(WINDOW_DAYS, None, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    body = render_template_string(ASK_BODY, examples=_ASK_EXAMPLES, model=CLAUDE_MODEL)
+    return render_template_string(
+        LAYOUT, body=body, css=CSS, sidebar=sidebar,
+        voice_now=voice_now, counts=counts, days=WINDOW_DAYS,
+        route="ask", page_title="Ask AI",
     )
 
 

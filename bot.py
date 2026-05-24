@@ -2,11 +2,16 @@
 import asyncio
 import datetime as dt
 import os
+import shutil
+import subprocess
 import sys
+import threading
 from collections import defaultdict
+from pathlib import Path
 
 import discord
 import libsql_experimental as libsql
+from flask import Flask, jsonify, request
 
 # ---------- config ----------
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -16,6 +21,11 @@ TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "60"))
 BACKFILL_CONCURRENCY = int(os.environ.get("BACKFILL_CONCURRENCY", "4"))
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+BOT_API_PORT = int(os.environ.get("BOT_API_PORT", "5001"))
+
+_ask_lock = threading.Lock()
+_WORK_DIR = Path(__file__).parent.resolve()
 
 if not TOKEN or not GUILD_ID:
     sys.exit("Set DISCORD_BOT_TOKEN and DISCORD_GUILD_ID.")
@@ -369,8 +379,83 @@ async def on_voice_state_update(member, before, after):
     conn.commit()
 
 
+# ---------- AI agent ----------
+
+def run_agent_query(question: str) -> dict:
+    """Run a natural-language question through Claude Code CLI."""
+    claude_bin = shutil.which("claude") or "claude"
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    db_abs = str(_WORK_DIR / "tracker.db")
+    prompt = (
+        f"You are an analytics assistant for the Parsewave Discord server.\n"
+        f"Read CLAUDE.md in your working directory for the full schema and context.\n"
+        f"The SQLite database is at: {db_abs}\n\n"
+        f"Question: {question}\n\n"
+        f"Query the database with sqlite3 or python3 as needed — run as many queries as necessary "
+        f"to give a complete, accurate answer. Return your answer as clean markdown with real names "
+        f"and numbers. Be specific and concise."
+    )
+    t0 = dt.datetime.now(dt.timezone.utc)
+    try:
+        result = subprocess.run(
+            [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL, "--allowedTools", "Bash"],
+            capture_output=True, text=True, timeout=180,
+            cwd=str(_WORK_DIR), env=env,
+        )
+        elapsed = round((dt.datetime.now(dt.timezone.utc) - t0).total_seconds(), 1)
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "unknown error").strip()[:800]
+            return {"ok": False, "elapsed": elapsed, "model": CLAUDE_MODEL,
+                    "answer": f"**Agent error (exit {result.returncode}):**\n```\n{stderr}\n```"}
+        answer = result.stdout.strip() or "*(agent returned no output)*"
+        return {"ok": True, "elapsed": elapsed, "model": CLAUDE_MODEL, "answer": answer}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "elapsed": 180, "model": CLAUDE_MODEL,
+                "answer": "**Query timed out** (>180s). Try a more specific question."}
+    except FileNotFoundError:
+        return {"ok": False, "elapsed": 0, "model": CLAUDE_MODEL,
+                "answer": "**`claude` CLI not found in PATH.** Install: `npm install -g @anthropic-ai/claude-code && claude login`"}
+    except Exception as e:
+        return {"ok": False, "elapsed": 0, "model": CLAUDE_MODEL,
+                "answer": f"**Unexpected error:** `{e}`"}
+
+
+# ---------- internal HTTP API (proxied by Vercel dashboard) ----------
+
+_bot_api = Flask("bot_api")
+
+
+@_bot_api.route("/internal/ask", methods=["POST"])
+def internal_ask():
+    data = request.get_json(silent=True) or {}
+    question = (data.get("q") or "").strip()
+    if not question:
+        return jsonify({"error": "no question"}), 400
+    if len(question) > 600:
+        return jsonify({"error": "question too long (max 600 chars)"}), 400
+    acquired = _ask_lock.acquire(timeout=6)
+    if not acquired:
+        return jsonify({"error": "Another query is already running, try again shortly."}), 429
+    try:
+        return jsonify(run_agent_query(question))
+    finally:
+        _ask_lock.release()
+
+
+@_bot_api.route("/internal/health")
+def internal_health():
+    return jsonify({"ok": True, "service": "bot"})
+
+
+def _start_bot_api():
+    _bot_api.run(host="0.0.0.0", port=BOT_API_PORT, debug=False, use_reloader=False)
+
+
 if __name__ == "__main__":
     print(f"Connecting to Turso: {TURSO_URL}")
     init_schema()
-    print("Schema ready. Starting bot...")
+    print("Schema ready. Starting bot API on port", BOT_API_PORT)
+    t = threading.Thread(target=_start_bot_api, daemon=True)
+    t.start()
+    print("Starting Discord bot...")
     client.run(TOKEN, log_handler=None)
