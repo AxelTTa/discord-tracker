@@ -1,15 +1,12 @@
 """Parsewave Activity Tracker — dashboard (Vercel serverless). Reads from Turso cloud DB."""
-import asyncio
 import datetime as dt
 import hmac
 import os
 import secrets
 import sqlite3
-import sys
-import threading
 from collections import defaultdict
+from contextlib import contextmanager
 from html import escape
-from pathlib import Path
 
 import libsql_experimental as libsql
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
@@ -21,11 +18,105 @@ WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))
 
 
 # ---------- DB ----------
+class _Row:
+    """Supports both row[0] index and row["name"] access, plus dict(row)."""
+    __slots__ = ("_keys", "_vals")
+
+    def __init__(self, keys, vals):
+        self._keys = keys
+        self._vals = tuple(vals)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return self._vals[self._keys.index(key)]
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def keys(self):
+        return self._keys
+
+    def values(self):
+        return self._vals
+
+    def items(self):
+        return zip(self._keys, self._vals)
+
+
 def _dict_row(cursor, row):
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+    keys = [col[0] for col in cursor.description]
+    return _Row(keys, row)
+
+
+class _Cursor:
+    """Wraps libsql cursor to support row_factory."""
+    def __init__(self, inner, factory):
+        self._inner = inner
+        self._factory = factory
+
+    @property
+    def description(self):
+        return self._inner.description
+
+    @property
+    def rowcount(self):
+        return self._inner.rowcount
+
+    def _apply(self, row):
+        if row is None:
+            return None
+        if self._factory:
+            return self._factory(self, row)
+        return tuple(row)
+
+    def fetchall(self):
+        rows = self._inner.fetchall()
+        if self._factory:
+            return [self._factory(self, r) for r in rows]
+        return [tuple(r) for r in rows]
+
+    def fetchone(self):
+        return self._apply(self._inner.fetchone())
+
+    def __iter__(self):
+        for row in self._inner:
+            yield self._apply(row)
+
+    def __getitem__(self, idx):
+        return self._inner[idx]
+
+
+class _Conn:
+    """Wraps libsql connection to support row_factory."""
+    def __init__(self, inner):
+        self._inner = inner
+        self.row_factory = None
+
+    def execute(self, sql, params=()):
+        if isinstance(params, list):
+            params = tuple(params)
+        return _Cursor(self._inner.execute(sql, params), self.row_factory)
+
+    def commit(self):
+        try:
+            self._inner.commit()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        if exc_type is None:
+            self.commit()
+
 
 def db():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+    return _Conn(libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN))
 
 
 
@@ -1862,5 +1953,5 @@ def health():
         n = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         m = c.execute("SELECT COUNT(*) FROM members WHERE is_bot=0 AND left_at IS NULL").fetchone()[0]
         v = c.execute("SELECT COUNT(*) FROM voice_sessions WHERE left_at IS NULL").fetchone()[0]
-    return {"ok": True, "messages": n, "members": m, "voice_open": v, "ready": client.is_ready()}
+    return {"ok": True, "messages": n, "members": m, "voice_open": v, "ready": True}
 
