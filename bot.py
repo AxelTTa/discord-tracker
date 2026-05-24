@@ -440,8 +440,7 @@ def run_agent_query(question: str) -> dict:
     t0 = dt.datetime.now(dt.timezone.utc)
     try:
         result = subprocess.run(
-            [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL,
-             "--allowedTools", "Bash", "--dangerously-skip-permissions"],
+            [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL, "--allowedTools", "Bash"],
             capture_output=True, text=True, timeout=180,
             cwd=str(_WORK_DIR), env=env,
         )
