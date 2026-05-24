@@ -453,10 +453,11 @@ def _start_bot_api():
 
 
 if __name__ == "__main__":
-    print(f"Connecting to Turso: {TURSO_URL}")
-    init_schema()
-    print("Schema ready. Starting bot API on port", BOT_API_PORT)
+    # Start Flask first so Railway's health check can pass immediately
+    print(f"Starting bot API on port {BOT_API_PORT}")
     t = threading.Thread(target=_start_bot_api, daemon=True)
     t.start()
-    print("Starting Discord bot...")
+    print(f"Connecting to Turso: {TURSO_URL}")
+    init_schema()
+    print("Schema ready. Starting Discord bot...")
     client.run(TOKEN, log_handler=None)
