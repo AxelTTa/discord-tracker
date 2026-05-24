@@ -392,7 +392,12 @@ def _ensure_claude_credentials():
     creds_file = creds_dir / ".credentials.json"
     if not creds_file.exists():
         creds_file.write_text(creds)
-        print("[claude] Wrote credentials from env", flush=True)
+        print(f"[claude] Wrote credentials to {creds_file}", flush=True)
+    # Write a minimal settings.json to skip first-run consent prompts
+    settings_file = creds_dir / "settings.json"
+    if not settings_file.exists():
+        settings_file.write_text('{"hasCompletedOnboarding":true}')
+        print("[claude] Wrote settings.json", flush=True)
 
 
 def run_agent_query(question: str) -> dict:
@@ -413,13 +418,14 @@ def run_agent_query(question: str) -> dict:
     t0 = dt.datetime.now(dt.timezone.utc)
     try:
         result = subprocess.run(
-            [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL, "--allowedTools", "Bash"],
+            [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL,
+             "--allowedTools", "Bash", "--dangerously-skip-permissions"],
             capture_output=True, text=True, timeout=180,
             cwd=str(_WORK_DIR), env=env,
         )
         elapsed = round((dt.datetime.now(dt.timezone.utc) - t0).total_seconds(), 1)
         if result.returncode != 0:
-            stderr = (result.stderr or result.stdout or "unknown error").strip()[:800]
+            stderr = (result.stderr or result.stdout or "no output").strip()[:1200]
             return {"ok": False, "elapsed": elapsed, "model": CLAUDE_MODEL,
                     "answer": f"**Agent error (exit {result.returncode}):**\n```\n{stderr}\n```"}
         answer = result.stdout.strip() or "*(agent returned no output)*"
