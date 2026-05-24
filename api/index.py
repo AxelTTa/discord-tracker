@@ -1,0 +1,1866 @@
+"""Parsewave Activity Tracker — dashboard (Vercel serverless). Reads from Turso cloud DB."""
+import asyncio
+import datetime as dt
+import hmac
+import os
+import secrets
+import sqlite3
+import sys
+import threading
+from collections import defaultdict
+from html import escape
+from pathlib import Path
+
+import libsql_experimental as libsql
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
+
+# ---------- config ----------
+TURSO_URL = os.environ.get("TURSO_URL")
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN")
+WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))
+
+
+# ---------- DB ----------
+def _dict_row(cursor, row):
+    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+def db():
+    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+
+
+
+# ---------- helpers ----------
+def humanize(iso):
+    if not iso:
+        return "never"
+    try:
+        ts = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return iso
+    s = int((dt.datetime.now(dt.timezone.utc) - ts).total_seconds())
+    if s < 60: return f"{s}s ago"
+    if s < 3600: return f"{s // 60}m ago"
+    if s < 86400: return f"{s // 3600}h ago"
+    if s < 86400 * 7: return f"{s // 86400}d ago"
+    if s < 86400 * 30: return f"{s // (86400 * 7)}w ago"
+    return f"{s // (86400 * 30)}mo ago"
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        ts = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=dt.timezone.utc)
+        return ts
+    except ValueError:
+        return None
+
+
+def presence_status(last_iso):
+    """Return (label, css_class) based on last activity."""
+    if not last_iso:
+        return ("inactive", "off")
+    ts = parse_iso(last_iso)
+    if not ts:
+        return ("inactive", "off")
+    sec = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
+    if sec < 60 * 30:   return ("active",  "online")
+    if sec < 3600 * 8:  return ("working", "online")
+    if sec < 86400:     return ("recent",  "idle")
+    if sec < 86400 * 7: return ("away",    "away")
+    return ("ghost", "off")
+
+
+def color_to_hex(c):
+    if not c or c == 0:
+        return "#b5bac1"
+    return f"#{c:06x}"
+
+
+# ---------- data ----------
+def build_sleep_grid(user_ids, days=7):
+    """For each user, return per-day list: {day, day_label, max_gap_h, slept, has_events}.
+    Day = calendar UTC day. Slept = max gap of inactivity within that day >= 8h."""
+    if not user_ids:
+        return {}
+    now = dt.datetime.now(dt.timezone.utc)
+    earliest = (now - dt.timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    placeholders = ",".join("?" * len(user_ids))
+    with db() as c:
+        rows = c.execute(
+            f"""SELECT user_id, ts FROM (
+                  SELECT author_id AS user_id, created_at AS ts FROM messages
+                    WHERE created_at >= ? AND author_id IN ({placeholders})
+                  UNION ALL
+                  SELECT user_id, joined_at AS ts FROM voice_sessions
+                    WHERE joined_at >= ? AND user_id IN ({placeholders})
+                ) ORDER BY user_id, ts""",
+            [earliest.isoformat(), *user_ids, earliest.isoformat(), *user_ids]
+        ).fetchall()
+    by_user = defaultdict(list)
+    for r in rows:
+        ts = parse_iso(r[1])
+        if ts:
+            by_user[r[0]].append(ts)
+    result = {}
+    for uid in user_ids:
+        events = by_user.get(uid, [])
+        grid = []
+        for d in range(days - 1, -1, -1):
+            day_start = (now - dt.timedelta(days=d)).replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + dt.timedelta(days=1)
+            window_end = min(day_end, now)
+            in_day = [e for e in events if day_start <= e < day_end]
+            moments = [day_start] + in_day + [window_end]
+            max_gap_h = 0
+            for i in range(1, len(moments)):
+                g = (moments[i] - moments[i - 1]).total_seconds() / 3600
+                if g > max_gap_h:
+                    max_gap_h = g
+            grid.append({
+                "day": day_start.strftime("%Y-%m-%d"),
+                "day_label": day_start.strftime("%a"),
+                "max_gap_h": round(max_gap_h, 1),
+                "slept": max_gap_h >= 8,
+                "has_events": len(in_day) > 0,
+            })
+        result[uid] = grid
+    return result
+
+
+def build_data(days, role_id, channel_id, search):
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = (now - dt.timedelta(days=days)).isoformat()
+    last24h = (now - dt.timedelta(hours=24)).isoformat()
+    last8h = (now - dt.timedelta(hours=8)).isoformat()
+
+    with db() as c:
+        c.row_factory = _dict_row
+
+        if role_id:
+            members = c.execute("""SELECT m.* FROM members m
+                                   JOIN member_roles mr ON mr.user_id = m.user_id
+                                   WHERE m.is_bot = 0 AND m.left_at IS NULL AND mr.role_id = ?""",
+                                (role_id,)).fetchall()
+        else:
+            members = c.execute("SELECT * FROM members WHERE is_bot = 0 AND left_at IS NULL").fetchall()
+
+        if search:
+            s = search.lower()
+            members = [m for m in members if s in (m["name"] or "").lower() or s in (m["display_name"] or "").lower()]
+
+        roles_by_user = defaultdict(list)
+        for r in c.execute("""SELECT mr.user_id, r.name, r.color, r.position
+                              FROM member_roles mr JOIN roles r ON r.role_id = mr.role_id
+                              WHERE r.name != '@everyone' ORDER BY r.position DESC""").fetchall():
+            roles_by_user[r["user_id"]].append(
+                {"name": r["name"], "color": color_to_hex(r["color"]), "position": r["position"]}
+            )
+
+        ch_clause = "AND channel_id = ?" if channel_id else ""
+        ch_params = [channel_id] if channel_id else []
+
+        msg_stats = {}
+        for r in c.execute(
+            f"""SELECT author_id, COUNT(*) as cnt, MAX(created_at) as last_at,
+                       SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS cnt_24h,
+                       SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS cnt_8h
+                FROM messages WHERE created_at >= ? {ch_clause}
+                GROUP BY author_id""",
+            [last24h, last8h, cutoff, *ch_params]
+        ).fetchall():
+            msg_stats[r["author_id"]] = r
+
+        last_msg = {}
+        for r in c.execute(
+            f"""SELECT author_id, content, created_at, channel_id FROM (
+                  SELECT *, ROW_NUMBER() OVER (PARTITION BY author_id ORDER BY id DESC) AS rn
+                  FROM messages WHERE created_at >= ? {ch_clause}
+                ) WHERE rn = 1""",
+            [cutoff, *ch_params]
+        ).fetchall():
+            last_msg[r["author_id"]] = dict(r)
+
+        top_channel = {}
+        for r in c.execute(
+            f"""SELECT author_id, channel_id, cnt FROM (
+                  SELECT author_id, channel_id, COUNT(*) AS cnt,
+                         ROW_NUMBER() OVER (PARTITION BY author_id ORDER BY COUNT(*) DESC) AS rn
+                  FROM messages WHERE created_at >= ? {ch_clause}
+                  GROUP BY author_id, channel_id
+                ) WHERE rn = 1""",
+            [cutoff, *ch_params]
+        ).fetchall():
+            top_channel[r["author_id"]] = (r["channel_id"], r["cnt"])
+
+        channel_names = {r["channel_id"]: r["name"] for r in c.execute("SELECT channel_id, name FROM channels").fetchall()}
+
+        voice_stats = {}
+        for r in c.execute(
+            """SELECT user_id,
+                      SUM(COALESCE(duration_sec,
+                          CAST((julianday('now') - julianday(joined_at)) * 86400 AS INTEGER))) AS sec,
+                      MAX(joined_at) AS last_join
+               FROM voice_sessions WHERE joined_at >= ?
+               GROUP BY user_id""",
+            [cutoff]
+        ).fetchall():
+            voice_stats[r["user_id"]] = r
+
+        ts_by_user = defaultdict(list)
+        for r in c.execute(
+            """SELECT user_id, ts FROM (
+                 SELECT author_id AS user_id, created_at AS ts FROM messages WHERE created_at >= ?
+                 UNION ALL
+                 SELECT user_id, joined_at AS ts FROM voice_sessions WHERE joined_at >= ?
+               ) ORDER BY user_id, ts""",
+            [last24h, last24h]
+        ).fetchall():
+            ts_by_user[r["user_id"]].append(r["ts"])
+
+        # daily activity for sparkline (last 7 days)
+        spark_cutoff = (now - dt.timedelta(days=7)).isoformat()
+        spark_raw = defaultdict(dict)
+        for r in c.execute(
+            f"""SELECT author_id, DATE(created_at) AS day, COUNT(*) AS cnt
+                FROM messages WHERE created_at >= ? {ch_clause}
+                GROUP BY author_id, DATE(created_at)""",
+            [spark_cutoff, *ch_params]
+        ).fetchall():
+            spark_raw[r["author_id"]][r["day"]] = r["cnt"]
+        days_list = [(now - dt.timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]
+
+    # who is currently in voice (for badge)
+    with db() as c2:
+        live_voice_set = {row[0] for row in c2.execute(
+            "SELECT user_id FROM voice_sessions WHERE left_at IS NULL"
+        ).fetchall()}
+
+    cutoff_dt = parse_iso(last24h)
+    rows = []
+    for m in members:
+        uid = m["user_id"]
+        ms = msg_stats.get(uid)
+        vs = voice_stats.get(uid)
+        lm = last_msg.get(uid)
+        cnt = ms["cnt"] if ms else 0
+        cnt_24h = ms["cnt_24h"] if ms else 0
+        cnt_8h = ms["cnt_8h"] if ms else 0
+        voice_sec = (vs["sec"] or 0) if vs else 0
+        voice_min = voice_sec // 60
+
+        moments = [cutoff_dt]
+        for t in ts_by_user.get(uid, []):
+            pt = parse_iso(t)
+            if pt:
+                moments.append(pt)
+        moments.append(now)
+        max_gap_h = 0
+        for i in range(1, len(moments)):
+            g = (moments[i] - moments[i - 1]).total_seconds() / 3600
+            if g > max_gap_h:
+                max_gap_h = g
+
+        last_at = ms["last_at"] if ms else None
+        if vs and vs["last_join"] and (not last_at or vs["last_join"] > last_at):
+            last_at = vs["last_join"]
+
+        tc = top_channel.get(uid)
+        top_ch_name = channel_names.get(tc[0]) if tc else None
+        top_ch_pct = round(tc[1] / cnt * 100) if tc and cnt else 0
+
+        spark = [spark_raw[uid].get(d, 0) for d in days_list]
+        spark_max = max(spark) if spark and max(spark) else 1
+
+        pres_label, pres_class = presence_status(last_at)
+
+        score = cnt + voice_min  # voice and messages weighted equally
+        top_role = (roles_by_user.get(uid) or [{"name": None, "color": "#b5bac1"}])[0]
+
+        rows.append({
+            "user_id": uid,
+            "name": m["display_name"] or m["name"],
+            "username": m["name"],
+            "avatar": m["avatar_url"],
+            "initial": (m["display_name"] or m["name"] or "?")[0].upper(),
+            "roles": roles_by_user.get(uid, [])[:3],
+            "top_role": top_role,
+            "msg_count": cnt,
+            "msg_24h": cnt_24h,
+            "msg_8h": cnt_8h,
+            "voice_min": voice_min,
+            "last_msg_content": (lm["content"] or "") if lm else "",
+            "last_msg_channel": channel_names.get(lm["channel_id"]) if lm else None,
+            "last_msg_at": humanize(lm["created_at"]) if lm else None,
+            "last_seen": humanize(last_at),
+            "last_seen_iso": last_at,
+            "score": score,
+            "sleep_gap_h": round(max_gap_h, 1),
+            "is_active": cnt > 0 or voice_min > 0,
+            "working_now": cnt_8h > 0,
+            "took_break": max_gap_h >= 8,
+            "in_vc_now": uid in live_voice_set,
+            "top_channel_name": top_ch_name,
+            "top_channel_pct": top_ch_pct,
+            "spark": spark,
+            "spark_max": spark_max,
+            "presence_label": pres_label,
+            "presence_class": pres_class,
+        })
+    return rows
+
+
+def sidebar_data(project_window_days=7, project_n=12):
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=project_window_days)).isoformat()
+    with db() as c:
+        c.row_factory = _dict_row
+        roles = c.execute("""SELECT r.role_id, r.name, r.color, r.position,
+                                    COUNT(mr.user_id) AS cnt
+                             FROM roles r
+                             LEFT JOIN member_roles mr ON mr.role_id = r.role_id
+                             LEFT JOIN members m ON m.user_id = mr.user_id
+                                                AND m.is_bot = 0 AND m.left_at IS NULL
+                             WHERE r.name != '@everyone'
+                             GROUP BY r.role_id
+                             HAVING cnt > 0
+                             ORDER BY r.position DESC""").fetchall()
+        channels = c.execute("""SELECT channel_id, name, category FROM channels
+                                WHERE type LIKE '%TextChannel%' OR type LIKE '%Thread%'
+                                ORDER BY category, name""").fetchall()
+        projects = c.execute("""SELECT m.channel_id, ch.name, ch.category,
+                                       COUNT(*) AS cnt
+                                FROM messages m
+                                LEFT JOIN channels ch ON ch.channel_id = m.channel_id
+                                WHERE m.created_at >= ?
+                                  AND ch.name NOT LIKE 'ticket-%'
+                                  AND ch.name NOT LIKE '%-comp'
+                                  AND ch.name NOT LIKE 'contributor-%'
+                                GROUP BY m.channel_id
+                                ORDER BY cnt DESC
+                                LIMIT ?""", (cutoff, project_n)).fetchall()
+        guild_meta = {
+            "name": "Parsewave (Developer)",
+            "total_messages": c.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
+            "total_members": c.execute("SELECT COUNT(*) FROM members WHERE is_bot=0 AND left_at IS NULL").fetchone()[0],
+        }
+    return {
+        "roles": [dict(r) for r in roles],
+        "channels": [dict(ch) for ch in channels],
+        "projects": [dict(p) for p in projects],
+        "meta": guild_meta,
+    }
+
+
+def top_projects_with_contributors(days=7, n=6, role_id=None):
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    out = []
+    with db() as c:
+        c.row_factory = _dict_row
+        rids = role_user_ids(c, role_id)
+        frag, p = role_filter_sql(rids, "m.author_id")
+        rows = c.execute(f"""SELECT m.channel_id, ch.name, ch.category,
+                                   COUNT(*) AS cnt,
+                                   COUNT(DISTINCT m.author_id) AS author_cnt
+                            FROM messages m
+                            LEFT JOIN channels ch ON ch.channel_id = m.channel_id
+                            WHERE m.created_at >= ?
+                              AND ch.name NOT LIKE 'ticket-%'
+                              AND ch.name NOT LIKE '%-comp'
+                              AND ch.name NOT LIKE 'contributor-%'
+                              {frag}
+                            GROUP BY m.channel_id
+                            ORDER BY cnt DESC
+                            LIMIT ?""", (cutoff, *p, n)).fetchall()
+        for r in rows:
+            top = c.execute(f"""SELECT m.author_id, mb.name, mb.display_name, mb.avatar_url, COUNT(*) AS cnt
+                               FROM messages m
+                               JOIN members mb ON mb.user_id = m.author_id
+                               WHERE m.channel_id = ? AND m.created_at >= ? AND mb.is_bot = 0
+                                 {frag}
+                               GROUP BY m.author_id ORDER BY cnt DESC LIMIT 4""",
+                            (r["channel_id"], cutoff, *p)).fetchall()
+            out.append({
+                "channel_id": r["channel_id"],
+                "name": r["name"],
+                "category": r["category"],
+                "cnt": r["cnt"],
+                "author_cnt": r["author_cnt"],
+                "top_contributors": [{
+                    "user_id": t["author_id"],
+                    "name": t["display_name"] or t["name"],
+                    "avatar": t["avatar_url"],
+                    "initial": (t["display_name"] or t["name"] or "?")[0].upper(),
+                    "cnt": t["cnt"],
+                } for t in top],
+            })
+    return out
+
+
+def role_user_ids(c, role_id):
+    """Return list of user_ids with the given role (None = all)."""
+    if role_id is None:
+        return None
+    return [r[0] for r in c.execute(
+        "SELECT user_id FROM member_roles WHERE role_id = ?", (role_id,)
+    ).fetchall()]
+
+
+def role_filter_sql(role_ids, alias):
+    """Return (WHERE-fragment, params) to AND-restrict by role_ids. Empty if None."""
+    if role_ids is None:
+        return "", []
+    if not role_ids:
+        return f" AND {alias} IN (NULL) ", []
+    return f" AND {alias} IN ({','.join('?' * len(role_ids))}) ", list(role_ids)
+
+
+def live_voice(role_id=None):
+    with db() as c:
+        c.row_factory = _dict_row
+        rids = role_user_ids(c, role_id)
+        frag, params = role_filter_sql(rids, "vs.user_id")
+        return [dict(r) for r in c.execute(f"""
+            SELECT vs.user_id, vs.channel_id, vs.joined_at,
+                   m.name, m.display_name, m.avatar_url,
+                   ch.name AS channel_name
+            FROM voice_sessions vs
+            JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
+            LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+            WHERE vs.left_at IS NULL {frag}
+            ORDER BY vs.joined_at
+        """, params).fetchall()]
+
+
+def voice_overview(days=7, role_id=None):
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    with db() as c:
+        c.row_factory = _dict_row
+        rids = role_user_ids(c, role_id)
+        frag_vs, p_vs = role_filter_sql(rids, "vs.user_id")
+        live = c.execute(f"""
+            SELECT vs.user_id, vs.channel_id, vs.joined_at,
+                   m.name, m.display_name, m.avatar_url,
+                   ch.name AS channel_name
+            FROM voice_sessions vs
+            JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
+            LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+            WHERE vs.left_at IS NULL {frag_vs}
+            ORDER BY vs.joined_at
+        """, p_vs).fetchall()
+        per_channel_stats = c.execute(f"""
+            SELECT vs.channel_id, ch.name,
+                   COUNT(*) AS session_cnt,
+                   COUNT(DISTINCT vs.user_id) AS unique_users,
+                   SUM(COALESCE(vs.duration_sec,
+                       CAST((julianday('now') - julianday(vs.joined_at)) * 86400 AS INTEGER))
+                   ) AS total_sec
+            FROM voice_sessions vs
+            LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+            WHERE vs.joined_at >= ? {frag_vs}
+            GROUP BY vs.channel_id
+            ORDER BY total_sec DESC
+        """, [cutoff, *p_vs]).fetchall()
+        top_voice_users = c.execute(f"""
+            SELECT vs.user_id, m.name, m.display_name, m.avatar_url,
+                   COUNT(*) AS sessions,
+                   SUM(COALESCE(vs.duration_sec,
+                       CAST((julianday('now') - julianday(vs.joined_at)) * 86400 AS INTEGER))
+                   ) AS total_sec
+            FROM voice_sessions vs
+            JOIN members m ON m.user_id = vs.user_id AND m.is_bot = 0
+            WHERE vs.joined_at >= ? {frag_vs}
+            GROUP BY vs.user_id
+            ORDER BY total_sec DESC
+            LIMIT 20
+        """, [cutoff, *p_vs]).fetchall()
+    live_by_channel = defaultdict(list)
+    for r in live:
+        live_by_channel[r["channel_id"]].append(dict(r))
+    return {
+        "live_by_channel": {k: v for k, v in live_by_channel.items()},
+        "per_channel_stats": [dict(r) for r in per_channel_stats],
+        "top_voice_users": [dict(r) for r in top_voice_users],
+        "live_count": len(live),
+    }
+
+
+# ---------- Flask ----------
+app = Flask(__name__)
+
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+app.secret_key = os.environ.get("FLASK_SECRET") or secrets.token_urlsafe(32)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=30)
+
+
+PUBLIC_ENDPOINTS = {"login", "logout", "health", "static"}
+
+@app.before_request
+def require_login():
+    # auth disabled when no password configured
+    if not DASHBOARD_PASSWORD:
+        return
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return
+    if session.get("authed"):
+        return
+    nxt = request.full_path if request.method == "GET" else "/"
+    return redirect(url_for("login", next=nxt))
+
+
+LOGIN_TEMPLATE = """
+<!doctype html><html><head><meta charset="utf-8"><title>Sign in · Parsewave Tracker</title>
+<style>
+@import url('https://rsms.me/inter/inter.css');
+body { background: #1e1f22; color: #f2f3f5; font-family: 'Inter', system-ui, sans-serif;
+  margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+.card { background: #2b2d31; border: 1px solid #1e1f22; border-radius: 12px; padding: 32px;
+  width: 100%; max-width: 380px; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+.logo { width: 56px; height: 56px; border-radius: 18px; background: #5865f2; color: #fff;
+  display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 24px;
+  margin: 0 auto 14px; }
+h1 { margin: 0 0 4px; text-align: center; font-size: 20px; }
+.sub { text-align: center; color: #b5bac1; font-size: 14px; margin-bottom: 22px; }
+label { display: block; color: #b5bac1; font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; margin-bottom: 6px; }
+input[type=password] { width: 100%; padding: 11px 12px; background: #1e1f22; color: #f2f3f5;
+  border: 1px solid #1e1f22; border-radius: 6px; font-size: 15px; outline: none; }
+input[type=password]:focus { border-color: #5865f2; }
+button { width: 100%; margin-top: 16px; padding: 11px; background: #5865f2; color: #fff;
+  border: 0; border-radius: 6px; font-weight: 600; font-size: 15px; cursor: pointer; }
+button:hover { background: #4752c4; }
+.err { background: rgba(242,63,67,.18); color: #ff5b5e; padding: 8px 12px; border-radius: 6px;
+  font-size: 13px; margin-bottom: 14px; }
+</style></head><body>
+<div class="card">
+  <div class="logo">P</div>
+  <h1>Parsewave Tracker</h1>
+  <div class="sub">Sign in to view the dashboard</div>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autofocus autocomplete="current-password">
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+</body></html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not DASHBOARD_PASSWORD:
+        return redirect("/")
+    error = None
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if hmac.compare_digest(pw, DASHBOARD_PASSWORD):
+            session["authed"] = True
+            session.permanent = True
+            nxt = request.args.get("next") or "/"
+            if not nxt.startswith("/"):
+                nxt = "/"
+            return redirect(nxt)
+        error = "Wrong password"
+    return render_template_string(LOGIN_TEMPLATE, error=error), (401 if error else 200)
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+CSS = """
+@import url('https://rsms.me/inter/inter.css');
+:root {
+  /* Discord's exact 2024+ palette */
+  --bg-tertiary:  #1e1f22;   /* deepest — server list / dividers */
+  --bg-secondary: #2b2d31;   /* sidebar */
+  --bg-primary:   #313338;   /* main chat area */
+  --bg-floating:  #2b2d31;
+  --bg-hover:     #35363c;
+  --bg-active:    #404249;
+  --bg-modifier-selected: rgba(78, 80, 88, 0.6);
+  --border:       #1e1f22;
+  --interactive-normal: #b5bac1;
+  --interactive-hover:  #dbdee1;
+  --interactive-active: #ffffff;
+  --interactive-muted:  #4e5058;
+  --header-primary:   #f2f3f5;
+  --header-secondary: #b5bac1;
+  --text-normal:  #dbdee1;
+  --text-muted:   #949ba4;
+  --text-link:    #00a8fc;
+  --brand:        #5865f2;
+  --brand-hover:  #4752c4;
+  --green:        #23a55a;
+  --yellow:       #f0b232;
+  --red:          #f23f43;
+  --grey:         #80848e;
+  /* legacy aliases used in template */
+  --bg-darker: var(--bg-tertiary);
+  --bg-dark:   var(--bg-secondary);
+  --bg:        var(--bg-secondary);
+  --bg-elev:   var(--bg-primary);
+  --text:      var(--header-primary);
+  --muted:     var(--header-secondary);
+  --dim:       var(--text-muted);
+  --accent:    var(--brand);
+  --accent-h:  var(--brand-hover);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: var(--bg-primary); color: var(--text-normal);
+  font-family: 'Inter', 'gg sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  font-size: 14px; line-height: 1.4; -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility; }
+@supports (font-variation-settings: normal) {
+  html, body { font-family: 'Inter var', 'gg sans', -apple-system, BlinkMacSystemFont, sans-serif; }
+}
+a { color: inherit; text-decoration: none; }
+button, select, input { font-family: inherit; font-size: 14px; color: var(--text); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1a1b1e; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #2b2d31; }
+
+.app { display: flex; min-height: 100vh; }
+
+/* Sidebar */
+.sidebar { width: 248px; flex: 0 0 248px; background: var(--bg); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; }
+.sidebar-header { padding: 14px 16px; box-shadow: 0 1px 0 var(--border); display: flex; align-items: center; gap: 10px;
+  position: sticky; top: 0; background: var(--bg); z-index: 2; }
+.server-icon { width: 38px; height: 38px; border-radius: 14px; background: var(--accent); color: #fff;
+  display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px;
+  flex-shrink: 0; }
+.server-name { font-weight: 700; font-size: 16px; }
+.server-sub { color: var(--dim); font-size: 12px; margin-top: 1px; }
+.sidebar-scroll { flex: 1; overflow-y: auto; padding: 12px 8px 24px; }
+.nav-section { margin-bottom: 18px; }
+.nav-section-title { color: var(--dim); font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .03em; padding: 8px 10px 4px; }
+.nav-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 6px;
+  color: var(--muted); cursor: pointer; font-size: 14px; margin-bottom: 2px; user-select: none; }
+.nav-item:hover { background: var(--bg-hover); color: var(--text); }
+.nav-item.active { background: rgba(88,101,242,.18); color: #fff; font-weight: 600; }
+.nav-item.active::before { content: ''; position: absolute; left: 0; width: 3px; height: 18px; background: #fff;
+  border-radius: 0 4px 4px 0; }
+.nav-item { position: relative; }
+.nav-item .icon { width: 18px; text-align: center; opacity: .9; flex-shrink: 0; }
+.nav-item .hash { color: var(--dim); font-weight: 500; }
+.nav-item .count { margin-left: auto; color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums;
+  background: var(--bg-hover); padding: 1px 7px; border-radius: 10px; }
+.nav-item.active .count { background: rgba(255,255,255,.1); color: #fff; }
+.nav-item .role-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.nav-item .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Main */
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.topbar { display: flex; gap: 10px; align-items: center; padding: 14px 24px;
+  border-bottom: 1px solid var(--border); background: var(--bg-elev); position: sticky; top: 0; z-index: 5; }
+.topbar h1 { margin: 0; font-size: 20px; font-weight: 700; }
+.topbar .subtitle { color: var(--muted); font-size: 13px; margin-left: 4px; }
+.spacer { flex: 1; }
+.topbar select, .topbar input { background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); padding: 7px 10px; outline: none; }
+.topbar input:focus, .topbar select:focus { border-color: var(--accent); }
+.topbar select:hover { background: var(--bg-hover); }
+
+.content { padding: 20px 24px 60px; flex: 1; }
+.section-title { color: var(--muted); font-size: 13px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; margin: 22px 0 10px; display: flex; align-items: center; gap: 8px; }
+.section-title .live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+  box-shadow: 0 0 0 4px rgba(35, 165, 90, .25); animation: pulse 2s infinite; }
+
+/* VC strip */
+.vc-strip { background: var(--bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+.vc-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.vc-card { display: flex; align-items: center; gap: 10px; background: var(--bg-hover); border-radius: 8px;
+  padding: 8px 12px; transition: background .12s; }
+.vc-card:hover { background: #45474e; }
+.vc-card .avatar { width: 32px; height: 32px; }
+.vc-name { font-weight: 600; font-size: 14px; }
+.vc-meta { color: var(--muted); font-size: 12px; }
+
+@keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .5 } }
+
+/* Stat cards */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 6px; }
+.stat { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.stat .v { font-size: 26px; font-weight: 700; line-height: 1.15; }
+.stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; margin-top: 4px; }
+.stat.green .v { color: var(--green); } .stat.yellow .v { color: var(--yellow); } .stat.red .v { color: var(--red); }
+
+/* Project cards */
+.proj-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.proj-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+  transition: border-color .15s, transform .12s; }
+.proj-card:hover { border-color: var(--accent); transform: translateY(-1px); cursor: pointer; }
+.proj-card .name { font-weight: 700; font-size: 15px; margin-bottom: 2px; }
+.proj-card .name .hash { color: var(--dim); margin-right: 2px; }
+.proj-card .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+.proj-card .meta .pill { display: inline-block; background: var(--bg-hover); padding: 1px 7px; border-radius: 10px;
+  margin-right: 5px; font-weight: 600; color: var(--text); }
+.proj-card .contribs { display: flex; flex-direction: column; gap: 3px; }
+.contrib-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px;
+  font-size: 13px; color: var(--muted); }
+.contrib-row:hover { background: var(--bg-hover); color: var(--text); }
+.contrib-row .avatar { width: 22px; height: 22px; font-size: 11px; }
+.contrib-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.contrib-row .cnt { font-variant-numeric: tabular-nums; color: var(--dim); font-size: 12px; }
+
+/* Member table */
+.panel { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.panel-header { display: flex; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--border);
+  color: var(--muted); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.panel-header .count { margin-left: 8px; color: var(--dim); font-weight: 500; }
+.panel-header a { margin-left: auto; color: var(--accent); font-size: 13px; font-weight: 600;
+  text-transform: none; letter-spacing: 0; }
+table.members { width: 100%; border-collapse: collapse; }
+table.members th, table.members td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border);
+  vertical-align: middle; font-size: 14px; }
+table.members thead th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .05em; position: sticky; top: 62px; background: var(--bg); z-index: 2; }
+table.members tbody tr:hover { background: var(--bg-hover); cursor: pointer; }
+table.members tbody tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+.member-cell { display: flex; align-items: center; gap: 12px; }
+.avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--bg-hover); display: inline-flex;
+  align-items: center; justify-content: center; color: #fff; font-weight: 700; font-size: 14px;
+  position: relative; flex-shrink: 0; overflow: hidden; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; }
+.avatar .status { position: absolute; bottom: -2px; right: -2px; width: 14px; height: 14px; border-radius: 50%;
+  border: 3px solid var(--bg); }
+.status.online { background: var(--green); } .status.idle { background: var(--yellow); }
+.status.away { background: var(--grey); } .status.off { background: #4e5058; }
+
+.member-name { font-weight: 600; font-size: 14.5px; }
+.member-handle { color: var(--dim); font-size: 12px; }
+
+.chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-right: 4px;
+  font-weight: 500; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.04); }
+.role-chip { font-weight: 600; }
+.role-chip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px;
+  vertical-align: middle; }
+
+.snippet { color: var(--muted); font-size: 13px; max-width: 320px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.snippet-meta { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
+.flag { display: inline-block; padding: 3px 8px; border-radius: 5px; font-size: 12px; font-weight: 600; }
+.flag.ok { background: rgba(35, 165, 90, .18); color: #3fce6f; }
+.flag.warn { background: rgba(240, 178, 50, .18); color: #f5c252; }
+.flag.bad { background: rgba(242, 63, 67, .22); color: #ff5b5e; }
+
+.spark { display: inline-flex; align-items: flex-end; gap: 2px; height: 26px; }
+.spark .bar { width: 6px; background: var(--accent); border-radius: 1px; opacity: .9; }
+.spark .bar.zero { background: var(--bg-hover); height: 3px !important; opacity: 1; }
+
+.empty { text-align: center; padding: 60px 20px; color: var(--muted); }
+.empty h3 { margin: 0 0 8px; color: var(--text); font-weight: 600; }
+
+/* Member detail page */
+.profile { padding: 24px; max-width: 1100px; margin: 0 auto; }
+.profile-header { display: flex; gap: 20px; align-items: center; margin-bottom: 22px; }
+.profile-header .avatar { width: 88px; height: 88px; font-size: 32px; }
+.profile-header h1 { margin: 0; font-size: 26px; }
+.profile-header .handle { color: var(--muted); font-size: 14px; }
+.profile-header .roles-strip { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+.back-link { color: var(--accent); font-size: 13px; padding-bottom: 8px; display: inline-block; font-weight: 600; }
+.section { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px;
+  margin-bottom: 14px; }
+.section h2 { margin: 0 0 12px; font-size: 13px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--muted); }
+.bar-chart { display: flex; align-items: flex-end; gap: 4px; height: 140px; padding: 6px 0; }
+.bar-chart .bar { flex: 1; background: var(--accent); border-radius: 2px; min-height: 2px; position: relative;
+  transition: background .12s; }
+.bar-chart .bar:hover { background: #7984f8; }
+.day-row { display: flex; gap: 4px; }
+.day-row .col { flex: 1; }
+.msg-row { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.msg-row:last-child { border-bottom: 0; }
+.msg-row .meta { color: var(--dim); font-size: 12px; margin-bottom: 3px; }
+.msg-row .body { font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+"""
+
+LAYOUT = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>{{ page_title }} · Parsewave Tracker</title>
+<style>{{ css }}</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <a class="sidebar-header" href="/" style="text-decoration:none;color:inherit;">
+      <div class="server-icon">P</div>
+      <div>
+        <div class="server-name">{{ sidebar.meta.name }}</div>
+        <div class="server-sub">{{ sidebar.meta.total_members }} members · {{ sidebar.meta.total_messages }} msgs</div>
+      </div>
+    </a>
+    <div class="sidebar-scroll">
+      {% set rq = ('&role=' ~ role_id) if role_id else '' %}
+      <div class="nav-section">
+        <div class="nav-section-title">Overview {% if role_id %}— role-scoped{% endif %}</div>
+        <a class="nav-item {% if route == 'home' %}active{% endif %}" href="/?days={{ days }}{{ rq }}"><span class="icon">🏠</span><span class="label">Home</span></a>
+        <a class="nav-item {% if route == 'members' and show == 'all' %}active{% endif %}" href="/members?days={{ days }}{{ rq }}"><span class="icon">👥</span><span class="label">All members</span> <span class="count">{{ sidebar.meta.total_members if not role_id else (counts.active + counts.inactive) }}</span></a>
+        <a class="nav-item {% if show == 'working' %}active{% endif %}"  href="/members?days={{ days }}{{ rq }}&show=working"><span class="icon">💼</span><span class="label">Working (8h)</span> <span class="count">{{ counts.working }}</span></a>
+        <a class="nav-item {% if show == 'active' %}active{% endif %}"   href="/members?days={{ days }}{{ rq }}&show=active"><span class="icon">🟢</span><span class="label">Active in window</span> <span class="count">{{ counts.active }}</span></a>
+        <a class="nav-item {% if route == 'voice' %}active{% endif %}" href="/voice?days={{ days }}{{ rq }}"><span class="icon">🎙</span><span class="label">Voice channels</span> <span class="count">{{ counts.voice_live }}</span></a>
+        <a class="nav-item {% if route == 'sleep' %}active{% endif %}" href="/sleep{% if role_id %}?role={{ role_id }}{% endif %}"><span class="icon">💤</span><span class="label">Sleep tracker</span> <span class="count">{{ counts.no_break }}</span></a>
+        <a class="nav-item {% if show == 'inactive' %}active{% endif %}" href="/members?days={{ days }}{{ rq }}&show=inactive"><span class="icon">😴</span><span class="label">Inactive in window</span> <span class="count">{{ counts.inactive }}</span></a>
+        {% if role_id %}<a class="nav-item" href="/?days={{ days }}" style="color:var(--text-link);"><span class="icon">✕</span><span class="label">Clear role filter</span></a>{% endif %}
+        <a class="nav-item {% if route == 'ask' %}active{% endif %}" href="/ask"><span class="icon">🤖</span><span class="label">Ask AI</span></a>
+      </div>
+      <div class="nav-section">
+        <div class="nav-section-title">Projects</div>
+        {% for p in sidebar.projects %}
+        <a class="nav-item {% if channel_id == p.channel_id %}active{% endif %}" href="/members?days={{ days }}{{ rq }}&channel={{ p.channel_id }}" title="{{ p.category or '' }}">
+          <span class="hash">#</span><span class="label">{{ p.name }}</span><span class="count">{{ p.cnt }}</span>
+        </a>
+        {% endfor %}
+      </div>
+      <div class="nav-section">
+        <div class="nav-section-title">Teams / Roles</div>
+        {% for r in sidebar.roles %}
+        <a class="nav-item {% if role_id == r.role_id %}active{% endif %}" href="/?days={{ days }}&role={{ r.role_id }}">
+          <span class="role-dot" style="background: {{ r.color if r.color and r.color != 0 else '#5865f2' }}"></span>
+          <span class="label">{{ r.name }}</span>
+          <span class="count">{{ r.cnt }}</span>
+        </a>
+        {% endfor %}
+      </div>
+      <div class="nav-section" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+        <a class="nav-item" href="/logout"><span class="icon">🚪</span><span class="label">Sign out</span></a>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    {{ body|safe }}
+  </div>
+</div>
+</body></html>
+"""
+
+INDEX_BODY = """
+<div class="topbar">
+  <h1>{{ page_title }}</h1>
+  <span class="subtitle">{{ filtered_count }} {{ 'member' if filtered_count == 1 else 'members' }} · {{ days }} day window</span>
+  <span class="spacer"></span>
+  <form method="get" style="display:flex;gap:8px;align-items:center;">
+    {% if role_id %}<input type="hidden" name="role" value="{{ role_id }}">{% endif %}
+    {% if channel_id %}<input type="hidden" name="channel" value="{{ channel_id }}">{% endif %}
+    {% if show %}<input type="hidden" name="show" value="{{ show }}">{% endif %}
+    <input type="search" name="q" value="{{ search }}" placeholder="Search members…" style="width:200px;">
+    <select name="days" onchange="this.form.submit()">
+      {% for d in [1,3,7,14,30,60] %}
+      <option value="{{ d }}" {% if d == days %}selected{% endif %}>{{ d }}d</option>
+      {% endfor %}
+    </select>
+    <select name="channel" onchange="this.form.submit()">
+      <option value="">All channels</option>
+      {% for ch in sidebar.channels %}
+      <option value="{{ ch.channel_id }}" {% if channel_id == ch.channel_id %}selected{% endif %}>{% if ch.category %}{{ ch.category }} / {% endif %}#{{ ch.name }}</option>
+      {% endfor %}
+    </select>
+    <select name="sort" onchange="this.form.submit()">
+      <option value="score"  {% if sort == 'score' %}selected{% endif %}>Score</option>
+      <option value="msgs"   {% if sort == 'msgs' %}selected{% endif %}>Messages</option>
+      <option value="msgs24" {% if sort == 'msgs24' %}selected{% endif %}>Msgs 24h</option>
+      <option value="voice"  {% if sort == 'voice' %}selected{% endif %}>Voice min</option>
+      <option value="last"   {% if sort == 'last' %}selected{% endif %}>Last seen</option>
+      <option value="sleep"  {% if sort == 'sleep' %}selected{% endif %}>Max gap (sleep)</option>
+      <option value="name"   {% if sort == 'name' %}selected{% endif %}>Name</option>
+    </select>
+    <button type="submit" style="display:none;">Apply</button>
+  </form>
+</div>
+
+<div class="content">
+  {% if voice_now %}
+  <div class="vc-strip">
+    <div class="vc-header"><span class="live"></span>Live in voice <span style="color:var(--dim);font-weight:500;">· {{ voice_now|length }} active</span></div>
+    <div class="vc-list">
+      {% for v in voice_now %}
+      <a class="vc-card" href="/member/{{ v.user_id }}">
+        <span class="avatar">{% if v.avatar_url %}<img src="{{ v.avatar_url }}" alt="">{% else %}{{ (v.display_name or v.name)[0]|upper }}{% endif %}<span class="status online"></span></span>
+        <div>
+          <div class="vc-name">{{ v.display_name or v.name }}</div>
+          <div class="vc-meta">🔊 {{ v.channel_name or '?' }} · {{ v.joined_at | humanize }}</div>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="stats">
+    <div class="stat"><div class="v">{{ filtered_count }}</div><div class="l">shown</div></div>
+    <div class="stat green"><div class="v">{{ counts.working }}</div><div class="l">working (last 8h)</div></div>
+    <div class="stat"><div class="v">{{ counts.active }}</div><div class="l">active in window</div></div>
+    <div class="stat red"><div class="v">{{ counts.no_break }}</div><div class="l">no 8h break (24h)</div></div>
+    <div class="stat"><div class="v">{{ counts.voice_live }}</div><div class="l">in voice now</div></div>
+    <div class="stat"><div class="v">{{ counts.total_msgs }}</div><div class="l">messages tracked</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">{{ page_title }} <span class="count">· {{ filtered_count }}</span></div>
+    {% if rows %}
+    <table class="members">
+      <thead><tr>
+        <th>Member</th>
+        <th>Role</th>
+        <th class="num">Msgs ({{ days }}d)</th>
+        <th class="num">24h</th>
+        <th class="num">8h</th>
+        <th class="num">Voice (min)</th>
+        <th>Activity 7d</th>
+        <th>Main channel</th>
+        <th>Last activity</th>
+        <th>24h gap</th>
+        <th>Status</th>
+      </tr></thead>
+      <tbody>
+      {% for r in rows %}
+      <tr onclick="location='/member/{{ r.user_id }}'">
+        <td>
+          <div class="member-cell">
+            <span class="avatar">
+              {% if r.avatar %}<img src="{{ r.avatar }}" alt="">{% else %}{{ r.initial }}{% endif %}
+              <span class="status {{ r.presence_class }}"></span>
+            </span>
+            <div>
+              <div class="member-name">{{ r.name }}{% if r.in_vc_now %} <span class="flag ok" style="margin-left:4px;font-size:10px;">🔊 LIVE</span>{% endif %}</div>
+              <div class="member-handle">{{ r.username }}</div>
+            </div>
+          </div>
+        </td>
+        <td>{% if r.top_role.name %}<span class="chip role-chip"><span class="dot" style="background: {{ r.top_role.color }}"></span>{{ r.top_role.name }}</span>{% else %}<span class="member-handle">—</span>{% endif %}</td>
+        <td class="num">{{ r.msg_count }}</td>
+        <td class="num">{{ r.msg_24h }}</td>
+        <td class="num">{{ r.msg_8h }}</td>
+        <td class="num">{{ r.voice_min }}{% if r.in_vc_now %} <span style="color:var(--green);font-size:10px;">●</span>{% endif %}</td>
+        <td>
+          <span class="spark">
+          {% for v in r.spark %}
+            <span class="bar {% if v == 0 %}zero{% endif %}" style="height: {{ (v / r.spark_max * 22)|round|int if v > 0 else 3 }}px;" title="{{ v }} msgs"></span>
+          {% endfor %}
+          </span>
+        </td>
+        <td>{% if r.top_channel_name %}<span class="chip">#{{ r.top_channel_name }}</span> <span class="member-handle">{{ r.top_channel_pct }}%</span>{% else %}<span class="member-handle">—</span>{% endif %}</td>
+        <td>
+          {% if r.last_msg_content %}
+          <div class="snippet">{{ r.last_msg_content[:80] }}</div>
+          <div class="snippet-meta">#{{ r.last_msg_channel or '?' }} · {{ r.last_seen }}</div>
+          {% else %}
+          <span class="member-handle">{{ r.last_seen }}</span>
+          {% endif %}
+        </td>
+        <td><span class="flag {% if r.took_break %}ok{% else %}bad{% endif %}">{{ r.sleep_gap_h }}h</span></td>
+        <td>
+          {% if r.working_now %}<span class="flag ok">working</span>
+          {% elif r.is_active %}<span class="flag warn">recent</span>
+          {% else %}<span class="flag bad">idle</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No members match these filters.</div>
+    {% endif %}
+  </div>
+</div>
+"""
+
+MEMBER_BODY = """
+<div class="profile">
+  <a class="back-link" href="javascript:history.back()">← Back</a>
+  <div class="profile-header">
+    <span class="avatar" style="width:80px;height:80px;font-size:30px;">
+      {% if m.avatar %}<img src="{{ m.avatar }}" alt="">{% else %}{{ m.initial }}{% endif %}
+      <span class="status {{ m.presence_class }}" style="width:18px;height:18px;border-width:3px;"></span>
+    </span>
+    <div>
+      <h1>{{ m.name }}</h1>
+      <div class="handle">{{ m.username }} · {{ m.presence_label }}</div>
+      <div class="roles-strip">
+        {% for role in m.roles_full %}
+        <span class="chip role-chip"><span class="dot" style="background:{{ role.color }}"></span>{{ role.name }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="v">{{ m.msg_count }}</div><div class="l">messages ({{ days }}d)</div></div>
+    <div class="stat green"><div class="v">{{ m.msg_24h }}</div><div class="l">last 24h</div></div>
+    <div class="stat"><div class="v">{{ m.voice_min }}</div><div class="l">voice minutes</div></div>
+    <div class="stat"><div class="v">{{ m.days_active }}</div><div class="l">days active</div></div>
+    <div class="stat {% if m.took_break %}green{% else %}red{% endif %}"><div class="v">{{ m.sleep_gap_h }}h</div><div class="l">max 24h gap</div></div>
+    <div class="stat"><div class="v">{{ m.last_seen }}</div><div class="l">last seen</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Daily activity — last 30 days</h2>
+    <div class="bar-chart">
+      {% for d in m.daily %}
+      <div class="bar" style="height: {{ (d.cnt / m.daily_max * 110)|round|int if d.cnt > 0 else 2 }}px;" title="{{ d.day }}: {{ d.cnt }} msgs"></div>
+      {% endfor %}
+    </div>
+    <div class="day-row">
+      {% for d in m.daily %}
+      <div class="col label" style="font-size:10px;color:var(--dim);text-align:center;">{% if loop.index0 % 5 == 0 %}{{ d.day[5:] }}{% endif %}</div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Sleep last 7 days <span style="color:var(--dim);font-weight:500;text-transform:none;">— green = 8h+ break, red = none, grey = no activity</span></h2>
+    <div style="display:flex;gap:10px;align-items:center;">
+      {% for d in m.sleep_grid %}
+      <div style="text-align:center;">
+        <div style="color:var(--dim);font-size:11px;font-weight:600;">{{ d.day_label }}</div>
+        <div style="color:var(--dim);font-size:10px;margin-bottom:4px;">{{ d.day[5:] }}</div>
+        {% if not d.has_events %}
+        <span title="{{ d.max_gap_h }}h gap (no activity)" style="display:inline-block;width:34px;height:34px;border-radius:50%;background:#4e5058;"></span>
+        {% elif d.slept %}
+        <span title="{{ d.max_gap_h }}h gap (slept)" style="display:inline-block;width:34px;height:34px;border-radius:50%;background:var(--green);"></span>
+        {% else %}
+        <span title="{{ d.max_gap_h }}h gap (no 8h break)" style="display:inline-block;width:34px;height:34px;border-radius:50%;background:var(--red);"></span>
+        {% endif %}
+        <div style="font-size:10px;color:var(--muted);margin-top:4px;">{{ d.max_gap_h }}h</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Top channels (their projects)</h2>
+    {% if m.top_channels %}
+    <table class="members" style="border-collapse:collapse;width:100%;">
+      <tbody>
+      {% for ch in m.top_channels %}
+      <tr>
+        <td><span class="chip">#{{ ch.name }}</span> {% if ch.category %}<span class="member-handle">{{ ch.category }}</span>{% endif %}</td>
+        <td class="num">{{ ch.cnt }} msgs</td>
+        <td class="num"><span class="member-handle">{{ ch.pct }}%</span></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<div class="member-handle">No messages in window.</div>{% endif %}
+  </div>
+
+  <div class="section">
+    <h2>Voice sessions ({{ days }}d)</h2>
+    {% if m.voice_sessions %}
+    <table class="members" style="width:100%;"><tbody>
+    {% for vs in m.voice_sessions %}
+    <tr><td><span class="chip">🔊 {{ vs.channel_name or '?' }}</span></td>
+        <td>{{ vs.joined }}</td>
+        <td class="num">{{ vs.duration_min }} min</td></tr>
+    {% endfor %}
+    </tbody></table>
+    {% else %}<div class="member-handle">No voice activity.</div>{% endif %}
+  </div>
+
+  <div class="section">
+    <h2>Recent messages</h2>
+    {% if m.recent_msgs %}
+    {% for msg in m.recent_msgs %}
+    <div class="msg-row">
+      <div class="meta">#{{ msg.channel_name or '?' }} · {{ msg.when }}</div>
+      <div class="body">{{ msg.content or '(empty)' }}</div>
+    </div>
+    {% endfor %}
+    {% else %}<div class="member-handle">No messages.</div>{% endif %}
+  </div>
+</div>
+"""
+
+HOME_BODY = """
+<div class="topbar">
+  <h1>Overview</h1>
+  <span class="subtitle">{{ sidebar.meta.name }} · last {{ days }} day(s){% if role_label %} · <span class="chip role-chip" style="margin-left:6px;"><span class="dot" style="background:#5865f2;"></span>{{ role_label }}</span>{% endif %}</span>
+  <span class="spacer"></span>
+  <form method="get" style="display:flex;gap:8px;align-items:center;">
+    <select name="days" onchange="this.form.submit()">
+      {% for d in [1,3,7,14,30,60] %}
+      <option value="{{ d }}" {% if d == days %}selected{% endif %}>{{ d }}d</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="content">
+  <div class="stats">
+    <div class="stat"><div class="v">{{ sidebar.meta.total_members }}</div><div class="l">members</div></div>
+    <div class="stat green"><div class="v">{{ counts.working }}</div><div class="l">working (last 8h)</div></div>
+    <div class="stat"><div class="v">{{ counts.active }}</div><div class="l">active in window</div></div>
+    <div class="stat red"><div class="v">{{ counts.no_break }}</div><div class="l">no 8h break (24h)</div></div>
+    <div class="stat"><div class="v">{{ counts.voice_live }}</div><div class="l">in voice now</div></div>
+    <div class="stat"><div class="v">{{ sidebar.meta.total_messages }}</div><div class="l">messages tracked</div></div>
+  </div>
+
+  {% if voice_now %}
+  <div class="section-title"><span class="live"></span>Live in voice · {{ voice_now|length }}</div>
+  <div class="vc-strip">
+    <div class="vc-list">
+      {% for v in voice_now %}
+      <a class="vc-card" href="/member/{{ v.user_id }}">
+        <span class="avatar">{% if v.avatar_url %}<img src="{{ v.avatar_url }}" alt="">{% else %}{{ (v.display_name or v.name)[0]|upper }}{% endif %}<span class="status online"></span></span>
+        <div>
+          <div class="vc-name">{{ v.display_name or v.name }}</div>
+          <div class="vc-meta">🔊 {{ v.channel_name or '?' }} · {{ v.joined_at | humanize }}</div>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="section-title">Top projects · {{ days }}d</div>
+  <div class="proj-grid">
+    {% for p in projects %}
+    <a class="proj-card" href="/members?days={{ days }}&channel={{ p.channel_id }}">
+      <div class="name"><span class="hash">#</span>{{ p.name }}</div>
+      <div class="meta"><span class="pill">{{ p.cnt }} msgs</span><span>{{ p.author_cnt }} contributors</span>{% if p.category %} · <span style="color:var(--dim);">{{ p.category }}</span>{% endif %}</div>
+      <div class="contribs">
+        {% for t in p.top_contributors %}
+        <div class="contrib-row">
+          <span class="avatar">{% if t.avatar %}<img src="{{ t.avatar }}" alt="">{% else %}{{ t.initial }}{% endif %}</span>
+          <span class="name">{{ t.name }}</span>
+          <span class="cnt">{{ t.cnt }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+
+  <div class="section-title" style="margin-top:24px;">Top performers · {{ days }}d</div>
+  <div class="panel">
+    <div class="panel-header">By total activity score <span class="count">· top {{ top_performers|length }}</span><a href="/members?days={{ days }}">See all →</a></div>
+    <table class="members">
+      <thead><tr>
+        <th>Member</th><th>Role</th><th class="num">Msgs</th><th class="num">Voice (min)</th>
+        <th>Main channel</th><th>Last activity</th><th>Status</th>
+      </tr></thead>
+      <tbody>
+      {% for r in top_performers %}
+      <tr onclick="location='/member/{{ r.user_id }}'">
+        <td>
+          <div class="member-cell">
+            <span class="avatar">{% if r.avatar %}<img src="{{ r.avatar }}" alt="">{% else %}{{ r.initial }}{% endif %}<span class="status {{ r.presence_class }}"></span></span>
+            <div><div class="member-name">{{ r.name }}</div><div class="member-handle">{{ r.username }}</div></div>
+          </div>
+        </td>
+        <td>{% if r.top_role.name %}<span class="chip role-chip"><span class="dot" style="background:{{ r.top_role.color }}"></span>{{ r.top_role.name }}</span>{% else %}<span class="member-handle">—</span>{% endif %}</td>
+        <td class="num">{{ r.msg_count }}</td>
+        <td class="num">{{ r.voice_min }}</td>
+        <td>{% if r.top_channel_name %}<span class="chip">#{{ r.top_channel_name }}</span>{% else %}<span class="member-handle">—</span>{% endif %}</td>
+        <td><span class="member-handle">{{ r.last_seen }}</span></td>
+        <td>
+          {% if r.working_now %}<span class="flag ok">working</span>
+          {% elif r.is_active %}<span class="flag warn">recent</span>
+          {% else %}<span class="flag bad">idle</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+SLEEP_BODY = """
+<div class="topbar">
+  <h1>💤 Sleep tracker</h1>
+  <span class="subtitle">8-hour break detection — last 7 days{% if role_label %} · <span class="chip role-chip" style="margin-left:6px;"><span class="dot" style="background:#5865f2;"></span>{{ role_label }}</span>{% endif %}</span>
+  <span class="spacer"></span>
+</div>
+<div class="content">
+  <div class="stats">
+    <div class="stat green"><div class="v">{{ stats.slept_last_night }}</div><div class="l">slept last night</div></div>
+    <div class="stat red"><div class="v">{{ stats.no_sleep_last_night }}</div><div class="l">didn't sleep last night</div></div>
+    <div class="stat"><div class="v">{{ stats.gray_last_night }}</div><div class="l">no activity last night</div></div>
+    <div class="stat red"><div class="v">{{ stats.no_sleep_3_plus }}</div><div class="l">3+ days no break</div></div>
+    <div class="stat"><div class="v">{{ stats.perfect_week }}</div><div class="l">slept all 7 days</div></div>
+  </div>
+
+  <div class="section-title">Sleep grid · last 7 days</div>
+  <div class="panel">
+    <div class="panel-header">Green = had 8h+ gap (slept) · Red = no 8h gap (concerning) · Grey = no activity that day</div>
+    <table class="members">
+      <thead><tr>
+        <th>Member</th>
+        {% for d in day_headers %}<th class="num" style="font-variant-numeric:normal;">{{ d.label }}<br><span style="color:var(--dim);font-weight:400;font-size:10px;">{{ d.date }}</span></th>{% endfor %}
+        <th class="num">Slept</th>
+        <th class="num">Missed</th>
+      </tr></thead>
+      <tbody>
+      {% for row in rows %}
+      <tr onclick="location='/member/{{ row.user_id }}'">
+        <td>
+          <div class="member-cell">
+            <span class="avatar">{% if row.avatar %}<img src="{{ row.avatar }}" alt="">{% else %}{{ row.initial }}{% endif %}</span>
+            <div><div class="member-name">{{ row.name }}</div><div class="member-handle">{{ row.username }}</div></div>
+          </div>
+        </td>
+        {% for d in row.grid %}
+        <td class="num">
+          {% if not d.has_events %}
+            <span title="No activity ({{ d.max_gap_h }}h gap)" style="display:inline-block;width:24px;height:24px;border-radius:50%;background:#4e5058;"></span>
+          {% elif d.slept %}
+            <span title="Slept ({{ d.max_gap_h }}h gap)" style="display:inline-block;width:24px;height:24px;border-radius:50%;background:var(--green);box-shadow:0 0 0 2px rgba(35,165,90,.15);"></span>
+          {% else %}
+            <span title="No 8h break — only {{ d.max_gap_h }}h gap" style="display:inline-block;width:24px;height:24px;border-radius:50%;background:var(--red);box-shadow:0 0 0 2px rgba(242,63,67,.15);"></span>
+          {% endif %}
+        </td>
+        {% endfor %}
+        <td class="num"><span class="flag ok">{{ row.slept_count }}</span></td>
+        <td class="num">{% if row.missed_count > 0 %}<span class="flag bad">{{ row.missed_count }}</span>{% else %}<span class="member-handle">0</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+"""
+
+
+VOICE_BODY = """
+<div class="topbar">
+  <h1>🎙 Voice channels</h1>
+  <span class="subtitle">{{ live_count }} in voice now · stats over last {{ days }}d{% if role_label %} · <span class="chip role-chip" style="margin-left:6px;"><span class="dot" style="background:#5865f2;"></span>{{ role_label }}</span>{% endif %}</span>
+  <span class="spacer"></span>
+  <form method="get" style="display:flex;gap:8px;align-items:center;">
+    <select name="days" onchange="this.form.submit()">
+      {% for d in [1,3,7,14,30,60] %}
+      <option value="{{ d }}" {% if d == days %}selected{% endif %}>{{ d }}d</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="content">
+  <div class="section-title"><span class="live"></span>Live in voice · {{ live_count }} {% if live_count != 1 %}people{% else %}person{% endif %}</div>
+  {% if live_by_channel %}
+  <div class="proj-grid">
+    {% for ch_id, members in live_by_channel.items() %}
+    <div class="proj-card">
+      <div class="name">🔊 {{ (members[0].channel_name if members else '?') }}</div>
+      <div class="meta"><span class="pill">{{ members|length }} in</span></div>
+      <div class="contribs">
+        {% for v in members %}
+        <a class="contrib-row" href="/member/{{ v.user_id }}">
+          <span class="avatar">{% if v.avatar_url %}<img src="{{ v.avatar_url }}" alt="">{% else %}{{ (v.display_name or v.name)[0]|upper }}{% endif %}<span class="status online"></span></span>
+          <span class="name">{{ v.display_name or v.name }}</span>
+          <span class="cnt">{{ v.joined_at | humanize }}</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty"><h3>Nobody is in voice right now.</h3><div>Live state populates the moment anyone joins a voice channel.</div></div>
+  {% endif %}
+
+  <div class="section-title">Voice channel activity · {{ days }}d</div>
+  <div class="panel">
+    <div class="panel-header">By total voice time</div>
+    {% if per_channel_stats %}
+    <table class="members">
+      <thead><tr><th>Channel</th><th class="num">Sessions</th><th class="num">Unique users</th><th class="num">Total time</th></tr></thead>
+      <tbody>
+      {% for ch in per_channel_stats %}
+      <tr>
+        <td><span class="chip">🔊 {{ ch.name or '?' }}</span></td>
+        <td class="num">{{ ch.session_cnt }}</td>
+        <td class="num">{{ ch.unique_users }}</td>
+        <td class="num">{{ (ch.total_sec // 60) if ch.total_sec else 0 }} min</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No voice activity in window yet.</div>
+    {% endif %}
+  </div>
+
+  <div class="section-title" style="margin-top:24px;">Top voice users · {{ days }}d</div>
+  <div class="panel">
+    <div class="panel-header">By total voice time <a href="/members?days={{ days }}&sort=voice">See full table →</a></div>
+    {% if top_voice_users %}
+    <table class="members">
+      <thead><tr><th>Member</th><th class="num">Sessions</th><th class="num">Total minutes</th></tr></thead>
+      <tbody>
+      {% for u in top_voice_users %}
+      <tr onclick="location='/member/{{ u.user_id }}'">
+        <td>
+          <div class="member-cell">
+            <span class="avatar">{% if u.avatar_url %}<img src="{{ u.avatar_url }}" alt="">{% else %}{{ (u.display_name or u.name)[0]|upper }}{% endif %}</span>
+            <div><div class="member-name">{{ u.display_name or u.name }}</div><div class="member-handle">{{ u.name }}</div></div>
+          </div>
+        </td>
+        <td class="num">{{ u.sessions }}</td>
+        <td class="num">{{ (u.total_sec // 60) if u.total_sec else 0 }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No voice activity in window yet.</div>
+    {% endif %}
+  </div>
+</div>
+"""
+
+
+ASK_BODY = """
+<div class="topbar">
+  <h1>🤖 Ask AI</h1>
+  <span class="subtitle">Full access · all messages · all data · Claude {{ model }}</span>
+  <span class="spacer"></span>
+</div>
+
+<div class="content">
+  <div class="section" style="margin-bottom:18px;">
+    <h2>Ask anything about the server</h2>
+    <div style="display:flex;gap:10px;margin-bottom:14px;">
+      <input type="text" id="ask-input"
+             placeholder="e.g. who's lowest performing on multimodal this month?"
+             style="flex:1;padding:11px 14px;background:var(--bg-tertiary);border:1px solid var(--border);
+                    border-radius:8px;color:var(--text);font-size:15px;outline:none;
+                    font-family:inherit;"
+             onkeydown="if(event.key==='Enter')doAsk()"
+             onfocus="this.style.borderColor='var(--brand)'"
+             onblur="this.style.borderColor='var(--border)'">
+      <button id="ask-btn" onclick="doAsk()"
+              style="padding:11px 24px;background:var(--brand);color:#fff;border:0;
+                     border-radius:8px;font-weight:700;font-size:15px;cursor:pointer;
+                     white-space:nowrap;transition:background .12s;"
+              onmouseover="this.style.background='var(--brand-hover)'"
+              onmouseout="this.style.background='var(--brand)'">
+        Ask →
+      </button>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:7px;">
+      {% for ex in examples %}
+      <button onclick="setQ(this)"
+              style="background:var(--bg-hover);border:1px solid var(--border);
+                     color:var(--muted);padding:5px 13px;border-radius:16px;
+                     font-size:13px;cursor:pointer;font-family:inherit;
+                     transition:color .1s,background .1s;"
+              onmouseover="this.style.background='var(--bg-active)';this.style.color='var(--text)'"
+              onmouseout="this.style.background='var(--bg-hover)';this.style.color='var(--muted)'">
+        {{ ex }}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div id="loading" style="display:none;" class="section" >
+    <div style="display:flex;align-items:center;gap:12px;color:var(--muted);font-size:14px;">
+      <span class="live" style="flex-shrink:0;"></span>
+      <span id="loading-msg">Claude is analyzing the data…</span>
+    </div>
+  </div>
+
+  <div id="result-wrap" style="display:none;" class="section">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h2 style="margin:0;">Answer</h2>
+      <span id="result-meta" style="color:var(--dim);font-size:12px;"></span>
+    </div>
+    <div id="result-content"
+         style="color:var(--text-normal);line-height:1.65;font-size:14.5px;">
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+marked.setOptions({ breaks: true, gfm: true });
+
+function setQ(btn) {
+  document.getElementById('ask-input').value = btn.textContent.trim();
+  document.getElementById('ask-input').focus();
+}
+
+let running = false;
+const msgs = [
+  "Claude is querying the database…",
+  "Running SQL queries…",
+  "Analyzing member activity…",
+  "Cross-referencing data…",
+  "Building your answer…",
+];
+let msgTimer;
+
+async function doAsk() {
+  const q = document.getElementById('ask-input').value.trim();
+  if (!q || running) return;
+
+  running = true;
+  document.getElementById('result-wrap').style.display = 'none';
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('ask-btn').disabled = true;
+  document.getElementById('ask-btn').textContent = '…';
+
+  let mi = 0;
+  document.getElementById('loading-msg').textContent = msgs[0];
+  msgTimer = setInterval(() => {
+    mi = (mi + 1) % msgs.length;
+    document.getElementById('loading-msg').textContent = msgs[mi];
+  }, 4000);
+
+  const t0 = Date.now();
+  try {
+    const resp = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q }),
+    });
+    const data = await resp.json();
+    const wall = ((Date.now() - t0) / 1000).toFixed(1);
+
+    if (resp.status === 429) {
+      document.getElementById('result-content').innerHTML =
+        '<div class="flag warn" style="font-size:14px;">Another query is running. Please wait a moment and try again.</div>';
+    } else {
+      document.getElementById('result-content').innerHTML =
+        marked.parse(data.answer || data.error || '*(empty response)*');
+    }
+    document.getElementById('result-meta').textContent =
+      `${wall}s · ${data.model || 'claude'}`;
+    document.getElementById('result-wrap').style.display = 'block';
+  } catch (e) {
+    document.getElementById('result-content').innerHTML =
+      '<strong>Request failed:</strong> ' + e.message;
+    document.getElementById('result-wrap').style.display = 'block';
+  } finally {
+    clearInterval(msgTimer);
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('ask-btn').disabled = false;
+    document.getElementById('ask-btn').textContent = 'Ask →';
+    running = false;
+  }
+}
+</script>
+"""
+
+
+app.jinja_env.filters["humanize"] = humanize
+
+
+def compute_counts(rows, voice_count, total_msgs):
+    return {
+        "working": sum(1 for r in rows if r["working_now"]),
+        "active": sum(1 for r in rows if r["is_active"]),
+        "no_break": sum(1 for r in rows if not r["took_break"]),
+        "inactive": sum(1 for r in rows if not r["is_active"]),
+        "voice_live": voice_count,
+        "total_msgs": total_msgs,
+    }
+
+
+SORT_KEYS = {
+    "score":  lambda r: (-r["score"], r["name"].lower()),
+    "msgs":   lambda r: (-r["msg_count"], r["name"].lower()),
+    "msgs24": lambda r: (-r["msg_24h"], r["name"].lower()),
+    "voice":  lambda r: (-r["voice_min"], r["name"].lower()),
+    "last":   lambda r: (r["last_seen_iso"] or "", r["name"].lower()),
+    "name":   lambda r: r["name"].lower(),
+    "sleep":  lambda r: (r["sleep_gap_h"], r["name"].lower()),
+}
+
+
+def parse_role(req):
+    rid = req.args.get("role")
+    return int(rid) if rid and rid.isdigit() else None
+
+
+@app.route("/")
+def home():
+    try:
+        days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
+    except ValueError:
+        days = WINDOW_DAYS
+    role_id = parse_role(request)
+    sidebar = sidebar_data()
+    voice_now = live_voice(role_id=role_id)
+    full_rows = build_data(days, role_id, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    projects = top_projects_with_contributors(days=days, n=6, role_id=role_id)
+    top_perf = sorted(full_rows, key=SORT_KEYS["score"])[:10]
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
+
+    body = render_template_string(
+        HOME_BODY,
+        sidebar=sidebar, voice_now=voice_now, counts=counts,
+        days=days, projects=projects, top_performers=top_perf,
+        role_id=role_id, role_label=role_label,
+    )
+    return render_template_string(
+        LAYOUT,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
+        channel_id=None, show="all", counts=counts, page_title="Overview",
+        route="home",
+    )
+
+
+@app.route("/members")
+def members():
+    try:
+        days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
+    except ValueError:
+        days = WINDOW_DAYS
+    role_id = request.args.get("role")
+    role_id = int(role_id) if role_id and role_id.isdigit() else None
+    channel_id = request.args.get("channel")
+    channel_id = int(channel_id) if channel_id and channel_id.isdigit() else None
+    sort = request.args.get("sort", "score")
+    if sort not in SORT_KEYS:
+        sort = "score"
+    show = request.args.get("show", "all")
+    search = (request.args.get("q") or "").strip()
+
+    sidebar = sidebar_data()
+    voice_now = live_voice()
+    rows = build_data(days, role_id, channel_id, search)
+
+    # voice members live filter
+    if show == "voice":
+        voice_uids = {v["user_id"] for v in voice_now}
+        rows = [r for r in rows if r["user_id"] in voice_uids]
+    elif show == "active":
+        rows = [r for r in rows if r["is_active"]]
+    elif show == "inactive":
+        rows = [r for r in rows if not r["is_active"]]
+    elif show == "working":
+        rows = [r for r in rows if r["working_now"]]
+    elif show == "nosleep":
+        rows = [r for r in rows if not r["took_break"]]
+
+    if sort == "last":
+        rows.sort(key=SORT_KEYS[sort], reverse=True)
+    else:
+        rows.sort(key=SORT_KEYS[sort])
+
+    # counts computed BEFORE the show-filter, against full role-filtered set
+    full_rows = build_data(days, role_id, channel_id, search)
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
+    page_title = role_label or {
+        "all": "All members", "active": "Active in window", "inactive": "Inactive in window",
+        "working": "Working (last 8h)", "voice": "In voice now", "nosleep": "No 8h break",
+    }.get(show, "All members")
+
+    body = render_template_string(
+        INDEX_BODY,
+        rows=rows, sidebar=sidebar, voice_now=voice_now, counts=counts,
+        days=days, role_id=role_id, channel_id=channel_id, sort=sort, show=show,
+        search=search, filtered_count=len(rows), page_title=page_title,
+    )
+    return render_template_string(
+        LAYOUT,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
+        channel_id=channel_id, show=show, counts=counts, page_title=page_title,
+        route="members",
+    )
+
+
+@app.route("/member/<int:user_id>")
+def member(user_id):
+    try:
+        days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
+    except ValueError:
+        days = WINDOW_DAYS
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = (now - dt.timedelta(days=days)).isoformat()
+
+    sidebar = sidebar_data()
+    voice_now = live_voice()
+
+    with db() as c:
+        c.row_factory = _dict_row
+        mem = c.execute("SELECT * FROM members WHERE user_id = ?", (user_id,)).fetchone()
+        if not mem:
+            abort(404)
+
+        roles_full = [
+            {"name": r["name"], "color": color_to_hex(r["color"])}
+            for r in c.execute("""SELECT r.name, r.color FROM member_roles mr
+                                  JOIN roles r ON r.role_id = mr.role_id
+                                  WHERE mr.user_id = ? AND r.name != '@everyone'
+                                  ORDER BY r.position DESC""", (user_id,)).fetchall()
+        ]
+        channel_names = {r["channel_id"]: (r["name"], r["category"]) for r in c.execute(
+            "SELECT channel_id, name, category FROM channels").fetchall()}
+
+        msg_total = c.execute("SELECT COUNT(*) FROM messages WHERE author_id = ? AND created_at >= ?",
+                              (user_id, cutoff)).fetchone()[0]
+        msg_24h = c.execute("SELECT COUNT(*) FROM messages WHERE author_id = ? AND created_at >= ?",
+                            (user_id, (now - dt.timedelta(hours=24)).isoformat())).fetchone()[0]
+        voice_sec_row = c.execute(
+            """SELECT SUM(COALESCE(duration_sec,
+                  CAST((julianday('now') - julianday(joined_at)) * 86400 AS INTEGER))) AS sec
+               FROM voice_sessions WHERE user_id = ? AND joined_at >= ?""",
+            (user_id, cutoff)).fetchone()
+        voice_min = (voice_sec_row["sec"] or 0) // 60 if voice_sec_row else 0
+
+        last_at = c.execute(
+            """SELECT MAX(ts) FROM (
+                 SELECT created_at AS ts FROM messages WHERE author_id = ?
+                 UNION ALL
+                 SELECT joined_at AS ts FROM voice_sessions WHERE user_id = ?)""",
+            (user_id, user_id)).fetchone()[0]
+
+        # daily activity last 30d
+        daily_raw = {r["day"]: r["cnt"] for r in c.execute(
+            """SELECT DATE(created_at) AS day, COUNT(*) AS cnt
+               FROM messages WHERE author_id = ? AND created_at >= ?
+               GROUP BY DATE(created_at)""", (user_id, cutoff)).fetchall()}
+        daily = []
+        for i in range(days - 1, -1, -1):
+            day = (now - dt.timedelta(days=i)).strftime("%Y-%m-%d")
+            daily.append({"day": day, "cnt": daily_raw.get(day, 0)})
+        daily_max = max((d["cnt"] for d in daily), default=1) or 1
+        days_active = sum(1 for d in daily if d["cnt"] > 0)
+
+        # sleep gap (last 24h)
+        last24h_iso = (now - dt.timedelta(hours=24)).isoformat()
+        ts_rows = c.execute(
+            """SELECT ts FROM (
+                 SELECT created_at AS ts FROM messages WHERE author_id = ? AND created_at >= ?
+                 UNION ALL
+                 SELECT joined_at FROM voice_sessions WHERE user_id = ? AND joined_at >= ?)
+               ORDER BY ts""", (user_id, last24h_iso, user_id, last24h_iso)).fetchall()
+        moments = [parse_iso(last24h_iso)]
+        for r in ts_rows:
+            pt = parse_iso(r[0])
+            if pt:
+                moments.append(pt)
+        moments.append(now)
+        max_gap = 0
+        for i in range(1, len(moments)):
+            g = (moments[i] - moments[i - 1]).total_seconds() / 3600
+            if g > max_gap:
+                max_gap = g
+
+        # top channels
+        top_channels_raw = c.execute(
+            """SELECT channel_id, COUNT(*) AS cnt FROM messages
+               WHERE author_id = ? AND created_at >= ?
+               GROUP BY channel_id ORDER BY cnt DESC LIMIT 10""",
+            (user_id, cutoff)).fetchall()
+        top_channels = []
+        for r in top_channels_raw:
+            name, cat = channel_names.get(r["channel_id"], (None, None))
+            top_channels.append({
+                "name": name or str(r["channel_id"]),
+                "category": cat,
+                "cnt": r["cnt"],
+                "pct": round(r["cnt"] / msg_total * 100) if msg_total else 0,
+            })
+
+        # voice sessions
+        voice_sessions = []
+        for r in c.execute(
+            """SELECT vs.channel_id, vs.joined_at, vs.left_at, vs.duration_sec, ch.name AS channel_name
+               FROM voice_sessions vs LEFT JOIN channels ch ON ch.channel_id = vs.channel_id
+               WHERE vs.user_id = ? AND vs.joined_at >= ?
+               ORDER BY vs.joined_at DESC LIMIT 30""",
+            (user_id, cutoff)).fetchall():
+            sec = r["duration_sec"]
+            if sec is None:
+                sec = int((now - parse_iso(r["joined_at"])).total_seconds())
+            voice_sessions.append({
+                "channel_name": r["channel_name"],
+                "joined": humanize(r["joined_at"]),
+                "duration_min": sec // 60,
+            })
+
+        # recent messages
+        recent_msgs = []
+        for r in c.execute(
+            """SELECT m.content, m.created_at, m.channel_id, ch.name AS channel_name
+               FROM messages m LEFT JOIN channels ch ON ch.channel_id = m.channel_id
+               WHERE m.author_id = ? ORDER BY m.id DESC LIMIT 25""",
+            (user_id,)).fetchall():
+            recent_msgs.append({
+                "content": r["content"],
+                "when": humanize(r["created_at"]),
+                "channel_name": r["channel_name"],
+            })
+
+    pres_label, pres_class = presence_status(last_at)
+
+    sleep_grid_one = build_sleep_grid([user_id], days=7).get(user_id, [])
+
+    m = {
+        "name": mem["display_name"] or mem["name"],
+        "username": mem["name"],
+        "avatar": mem["avatar_url"],
+        "initial": (mem["display_name"] or mem["name"] or "?")[0].upper(),
+        "roles_full": roles_full,
+        "msg_count": msg_total,
+        "msg_24h": msg_24h,
+        "voice_min": voice_min,
+        "days_active": days_active,
+        "last_seen": humanize(last_at),
+        "presence_label": pres_label,
+        "presence_class": pres_class,
+        "sleep_gap_h": round(max_gap, 1),
+        "took_break": max_gap >= 8,
+        "daily": daily,
+        "daily_max": daily_max,
+        "top_channels": top_channels,
+        "voice_sessions": voice_sessions,
+        "recent_msgs": recent_msgs,
+        "sleep_grid": sleep_grid_one,
+    }
+
+    counts = compute_counts(build_data(days, None, None, ""), len(voice_now),
+                            sidebar["meta"]["total_messages"])
+    body = render_template_string(MEMBER_BODY, m=m, days=days)
+    return render_template_string(
+        LAYOUT,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=None, channel_id=None,
+        show="all", counts=counts, page_title=m["name"], route="member",
+    )
+
+
+@app.route("/sleep")
+def sleep_page():
+    days = 7
+    role_id = parse_role(request)
+    sidebar = sidebar_data()
+    voice_now = live_voice(role_id=role_id)
+    full_rows = build_data(days, role_id, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
+
+    # Only show members with any activity in last 7d (and matching role if any)
+    with db() as c:
+        c.row_factory = _dict_row
+        rids = role_user_ids(c, role_id)
+        role_frag, role_p = role_filter_sql(rids, "user_id")
+        active_uids = [r["uid"] for r in c.execute(f"""
+            SELECT user_id AS uid FROM (
+              SELECT author_id AS user_id FROM messages
+                WHERE created_at >= datetime('now', '-7 days')
+              UNION
+              SELECT user_id FROM voice_sessions
+                WHERE joined_at >= datetime('now', '-7 days')
+            ) WHERE 1=1 {role_frag}
+        """, role_p).fetchall()]
+        member_info = {r["user_id"]: dict(r) for r in c.execute(f"""
+            SELECT user_id, name, display_name, avatar_url FROM members
+            WHERE is_bot = 0 AND left_at IS NULL AND user_id IN ({",".join("?" * len(active_uids)) or "NULL"})
+        """, active_uids).fetchall()} if active_uids else {}
+
+    grid_by_user = build_sleep_grid(active_uids, days=7)
+    day_headers = []
+    if active_uids:
+        first_uid = next(iter(grid_by_user.keys()), None)
+        if first_uid:
+            day_headers = [{"label": d["day_label"], "date": d["day"][5:]} for d in grid_by_user[first_uid]]
+
+    rows = []
+    for uid, grid in grid_by_user.items():
+        info = member_info.get(uid)
+        if not info:
+            continue
+        slept = sum(1 for d in grid if d["slept"])
+        missed = sum(1 for d in grid if not d["slept"] and d["has_events"])
+        # longest run of consecutive "no sleep" days at the end
+        run = 0
+        for d in reversed(grid):
+            if d["has_events"] and not d["slept"]:
+                run += 1
+            else:
+                break
+        rows.append({
+            "user_id": uid,
+            "name": info["display_name"] or info["name"],
+            "username": info["name"],
+            "avatar": info["avatar_url"],
+            "initial": (info["display_name"] or info["name"] or "?")[0].upper(),
+            "grid": grid,
+            "slept_count": slept,
+            "missed_count": missed,
+            "current_no_sleep_run": run,
+        })
+    # Sort by current no-sleep run desc, then missed_count desc
+    rows.sort(key=lambda r: (-r["current_no_sleep_run"], -r["missed_count"], r["name"].lower()))
+
+    stats = {
+        "slept_last_night":   sum(1 for r in rows if r["grid"][-1]["slept"]),
+        "no_sleep_last_night": sum(1 for r in rows if r["grid"][-1]["has_events"] and not r["grid"][-1]["slept"]),
+        "gray_last_night":    sum(1 for r in rows if not r["grid"][-1]["has_events"]),
+        "no_sleep_3_plus":    sum(1 for r in rows if r["current_no_sleep_run"] >= 3),
+        "perfect_week":       sum(1 for r in rows if r["slept_count"] == 7),
+    }
+
+    body = render_template_string(SLEEP_BODY, rows=rows, day_headers=day_headers, stats=stats,
+                                  role_label=role_label, role_id=role_id)
+    return render_template_string(
+        LAYOUT, body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
+        channel_id=None, show="all", counts=counts, page_title="Sleep tracker", route="sleep",
+    )
+
+
+@app.route("/voice")
+def voice_page():
+    try:
+        days = max(1, min(int(request.args.get("days", WINDOW_DAYS)), WINDOW_DAYS))
+    except ValueError:
+        days = WINDOW_DAYS
+    role_id = parse_role(request)
+    sidebar = sidebar_data()
+    voice_now = live_voice(role_id=role_id)
+    full_rows = build_data(days, role_id, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    overview = voice_overview(days, role_id=role_id)
+    role_label = next((r["name"] for r in sidebar["roles"] if r["role_id"] == role_id), None)
+    body = render_template_string(
+        VOICE_BODY,
+        days=days, live_count=overview["live_count"],
+        live_by_channel=overview["live_by_channel"],
+        per_channel_stats=overview["per_channel_stats"],
+        top_voice_users=overview["top_voice_users"],
+        role_label=role_label, role_id=role_id,
+    )
+    return render_template_string(
+        LAYOUT,
+        body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
+        channel_id=None, show="all", counts=counts, page_title="Voice channels",
+        route="voice",
+    )
+
+
+@app.route("/health")
+def health():
+    with db() as c:
+        n = c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        m = c.execute("SELECT COUNT(*) FROM members WHERE is_bot=0 AND left_at IS NULL").fetchone()[0]
+        v = c.execute("SELECT COUNT(*) FROM voice_sessions WHERE left_at IS NULL").fetchone()[0]
+    return {"ok": True, "messages": n, "members": m, "voice_open": v, "ready": client.is_ready()}
+
