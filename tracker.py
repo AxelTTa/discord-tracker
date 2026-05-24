@@ -4,7 +4,9 @@ import datetime as dt
 import hmac
 import os
 import secrets
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 from collections import defaultdict
@@ -21,6 +23,7 @@ DB = os.environ.get("DB_PATH", "tracker.db")
 BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "60"))
 BACKFILL_CONCURRENCY = int(os.environ.get("BACKFILL_CONCURRENCY", "4"))
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))  # retention + max UI window
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 if not TOKEN or not GUILD_ID:
     sys.exit("Set DISCORD_BOT_TOKEN and DISCORD_GUILD_ID.")
@@ -837,6 +840,63 @@ app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=30)
 
 PUBLIC_ENDPOINTS = {"login", "logout", "health", "static"}
 
+# ---------- AI Agent ----------
+_ask_lock = threading.Lock()
+_WORK_DIR = Path(__file__).parent.resolve()
+
+
+def run_agent_query(question: str) -> dict:
+    """Run a natural-language question through Claude Code CLI with full DB access.
+
+    Follows the same pattern as feature4-worker: ANTHROPIC_API_KEY is unset so
+    Claude Code uses OAuth subscription auth (no API billing).
+    """
+    db_abs = str(_WORK_DIR / DB)
+    claude_bin = shutil.which("claude") or "claude"
+
+    # Strip API key — use OAuth subscription exactly as feature4-worker does
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+    prompt = (
+        f"You are an analytics assistant for the Parsewave Discord server.\n"
+        f"Read CLAUDE.md in your working directory for the full schema and context.\n"
+        f"The SQLite database is at: {db_abs}\n\n"
+        f"Question: {question}\n\n"
+        f"Query the database with sqlite3 or python3 as needed — run as many queries as necessary "
+        f"to give a complete, accurate answer. Return your answer as clean markdown with real names "
+        f"and numbers. Be specific and concise."
+    )
+
+    t0 = dt.datetime.now(dt.timezone.utc)
+    try:
+        result = subprocess.run(
+            [claude_bin, "-p", prompt, "--model", CLAUDE_MODEL, "--allowedTools", "Bash"],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(_WORK_DIR), env=env,
+        )
+        elapsed = round((dt.datetime.now(dt.timezone.utc) - t0).total_seconds(), 1)
+
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "unknown error").strip()[:800]
+            return {"ok": False, "elapsed": elapsed, "model": CLAUDE_MODEL,
+                    "answer": f"**Agent error (exit {result.returncode}):**\n```\n{stderr}\n```"}
+
+        answer = result.stdout.strip() or "*(agent returned no output)*"
+        return {"ok": True, "elapsed": elapsed, "model": CLAUDE_MODEL, "answer": answer}
+
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "elapsed": 120, "model": CLAUDE_MODEL,
+                "answer": "**Query timed out** (>120s). Try a more specific question."}
+    except FileNotFoundError:
+        return {"ok": False, "elapsed": 0, "model": CLAUDE_MODEL,
+                "answer": (
+                    "**`claude` CLI not found in PATH.**\n\n"
+                    "Install and authenticate: `npm install -g @anthropic-ai/claude-code && claude login`"
+                )}
+    except Exception as e:
+        return {"ok": False, "elapsed": 0, "model": CLAUDE_MODEL,
+                "answer": f"**Unexpected error:** `{e}`"}
+
 
 @app.before_request
 def require_login():
@@ -1158,6 +1218,7 @@ LAYOUT = """
         <a class="nav-item {% if route == 'sleep' %}active{% endif %}" href="/sleep{% if role_id %}?role={{ role_id }}{% endif %}"><span class="icon">💤</span><span class="label">Sleep tracker</span> <span class="count">{{ counts.no_break }}</span></a>
         <a class="nav-item {% if show == 'inactive' %}active{% endif %}" href="/members?days={{ days }}{{ rq }}&show=inactive"><span class="icon">😴</span><span class="label">Inactive in window</span> <span class="count">{{ counts.inactive }}</span></a>
         {% if role_id %}<a class="nav-item" href="/?days={{ days }}" style="color:var(--text-link);"><span class="icon">✕</span><span class="label">Clear role filter</span></a>{% endif %}
+        <a class="nav-item {% if route == 'ask' %}active{% endif %}" href="/ask"><span class="icon">🤖</span><span class="label">Ask AI</span></a>
       </div>
       <div class="nav-section">
         <div class="nav-section-title">Projects</div>
@@ -1668,6 +1729,140 @@ VOICE_BODY = """
 """
 
 
+ASK_BODY = """
+<div class="topbar">
+  <h1>🤖 Ask AI</h1>
+  <span class="subtitle">Full access · all messages · all data · Claude {{ model }}</span>
+  <span class="spacer"></span>
+</div>
+
+<div class="content">
+  <div class="section" style="margin-bottom:18px;">
+    <h2>Ask anything about the server</h2>
+    <div style="display:flex;gap:10px;margin-bottom:14px;">
+      <input type="text" id="ask-input"
+             placeholder="e.g. who's lowest performing on multimodal this month?"
+             style="flex:1;padding:11px 14px;background:var(--bg-tertiary);border:1px solid var(--border);
+                    border-radius:8px;color:var(--text);font-size:15px;outline:none;
+                    font-family:inherit;"
+             onkeydown="if(event.key==='Enter')doAsk()"
+             onfocus="this.style.borderColor='var(--brand)'"
+             onblur="this.style.borderColor='var(--border)'">
+      <button id="ask-btn" onclick="doAsk()"
+              style="padding:11px 24px;background:var(--brand);color:#fff;border:0;
+                     border-radius:8px;font-weight:700;font-size:15px;cursor:pointer;
+                     white-space:nowrap;transition:background .12s;"
+              onmouseover="this.style.background='var(--brand-hover)'"
+              onmouseout="this.style.background='var(--brand)'">
+        Ask →
+      </button>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:7px;">
+      {% for ex in examples %}
+      <button onclick="setQ(this)"
+              style="background:var(--bg-hover);border:1px solid var(--border);
+                     color:var(--muted);padding:5px 13px;border-radius:16px;
+                     font-size:13px;cursor:pointer;font-family:inherit;
+                     transition:color .1s,background .1s;"
+              onmouseover="this.style.background='var(--bg-active)';this.style.color='var(--text)'"
+              onmouseout="this.style.background='var(--bg-hover)';this.style.color='var(--muted)'">
+        {{ ex }}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div id="loading" style="display:none;" class="section" >
+    <div style="display:flex;align-items:center;gap:12px;color:var(--muted);font-size:14px;">
+      <span class="live" style="flex-shrink:0;"></span>
+      <span id="loading-msg">Claude is analyzing the data…</span>
+    </div>
+  </div>
+
+  <div id="result-wrap" style="display:none;" class="section">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h2 style="margin:0;">Answer</h2>
+      <span id="result-meta" style="color:var(--dim);font-size:12px;"></span>
+    </div>
+    <div id="result-content"
+         style="color:var(--text-normal);line-height:1.65;font-size:14.5px;">
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+marked.setOptions({ breaks: true, gfm: true });
+
+function setQ(btn) {
+  document.getElementById('ask-input').value = btn.textContent.trim();
+  document.getElementById('ask-input').focus();
+}
+
+let running = false;
+const msgs = [
+  "Claude is querying the database…",
+  "Running SQL queries…",
+  "Analyzing member activity…",
+  "Cross-referencing data…",
+  "Building your answer…",
+];
+let msgTimer;
+
+async function doAsk() {
+  const q = document.getElementById('ask-input').value.trim();
+  if (!q || running) return;
+
+  running = true;
+  document.getElementById('result-wrap').style.display = 'none';
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('ask-btn').disabled = true;
+  document.getElementById('ask-btn').textContent = '…';
+
+  let mi = 0;
+  document.getElementById('loading-msg').textContent = msgs[0];
+  msgTimer = setInterval(() => {
+    mi = (mi + 1) % msgs.length;
+    document.getElementById('loading-msg').textContent = msgs[mi];
+  }, 4000);
+
+  const t0 = Date.now();
+  try {
+    const resp = await fetch('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q }),
+    });
+    const data = await resp.json();
+    const wall = ((Date.now() - t0) / 1000).toFixed(1);
+
+    if (resp.status === 429) {
+      document.getElementById('result-content').innerHTML =
+        '<div class="flag warn" style="font-size:14px;">Another query is running. Please wait a moment and try again.</div>';
+    } else {
+      document.getElementById('result-content').innerHTML =
+        marked.parse(data.answer || data.error || '*(empty response)*');
+    }
+    document.getElementById('result-meta').textContent =
+      `${wall}s · ${data.model || 'claude'}`;
+    document.getElementById('result-wrap').style.display = 'block';
+  } catch (e) {
+    document.getElementById('result-content').innerHTML =
+      '<strong>Request failed:</strong> ' + e.message;
+    document.getElementById('result-wrap').style.display = 'block';
+  } finally {
+    clearInterval(msgTimer);
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('ask-btn').disabled = false;
+    document.getElementById('ask-btn').textContent = 'Ask →';
+    running = false;
+  }
+}
+</script>
+"""
+
+
 app.jinja_env.filters["humanize"] = humanize
 
 
@@ -2056,6 +2251,51 @@ def voice_page():
         body=body, css=CSS, sidebar=sidebar, days=days, role_id=role_id,
         channel_id=None, show="all", counts=counts, page_title="Voice channels",
         route="voice",
+    )
+
+
+_ASK_EXAMPLES = [
+    "Who's lowest performing on multimodal this month?",
+    "Who has the most voice time this week?",
+    "Which project had the most activity yesterday?",
+    "Who hasn't taken an 8h break in the last 3 days?",
+    "Compare top contributors on long-horizon vs multimodal",
+    "Who joined the server most recently?",
+    "What are people talking about in tbench today?",
+    "Who's been most active overall in the last 7 days?",
+]
+
+
+@app.route("/ask", methods=["GET", "POST"])
+def ask():
+    sidebar = sidebar_data()
+    voice_now = live_voice()
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        question = (data.get("q") or "").strip()
+        if not question:
+            return jsonify({"error": "no question provided"}), 400
+        if len(question) > 600:
+            return jsonify({"error": "question too long (max 600 chars)"}), 400
+
+        acquired = _ask_lock.acquire(timeout=6)
+        if not acquired:
+            return jsonify({"error": "Another query is running — please wait a moment."}), 429
+        try:
+            result = run_agent_query(question)
+        finally:
+            _ask_lock.release()
+        return jsonify(result)
+
+    full_rows = build_data(WINDOW_DAYS, None, None, "")
+    counts = compute_counts(full_rows, len(voice_now), sidebar["meta"]["total_messages"])
+    body = render_template_string(ASK_BODY, examples=_ASK_EXAMPLES, model=CLAUDE_MODEL)
+    return render_template_string(
+        LAYOUT,
+        body=body, css=CSS, sidebar=sidebar, days=WINDOW_DAYS,
+        role_id=None, channel_id=None, show="all",
+        counts=counts, page_title="Ask AI", route="ask",
     )
 
 
