@@ -595,7 +595,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["PERMANENT_SESSION_LIFETIME"] = dt.timedelta(days=30)
 
 
-PUBLIC_ENDPOINTS = {"login", "logout", "health", "static"}
+PUBLIC_ENDPOINTS = {"login", "logout", "static"}
 
 @app.before_request
 def require_login():
