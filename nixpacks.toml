@@ -2,4 +2,4 @@
 nixPkgs = ["python312", "python312Packages.pip"]
 
 [start]
-cmd = "python bot.py"
+cmd = "/opt/venv/bin/python bot.py"

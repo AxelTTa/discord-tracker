@@ -2,7 +2,7 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python bot.py"
+startCommand = "/opt/venv/bin/python bot.py"
 healthcheckPath = "/internal/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
