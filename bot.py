@@ -453,7 +453,13 @@ def _start_bot_api():
 
 
 def _init_and_run_bot():
-    """Run schema init + Discord bot in a thread so Flask can respond to health checks immediately."""
+    """Run schema init + Discord bot in a thread so Flask can respond to health checks immediately.
+
+    libsql_experimental holds the Python GIL during Turso I/O, which would block Flask from
+    handling requests. Sleep 5s first to let Flask fully bind and pass Railway's health check.
+    """
+    import time
+    time.sleep(5)  # give Flask time to bind and pass the Railway health check
     print(f"[bot] Connecting to Turso: {TURSO_URL}", flush=True)
     init_schema()
     print("[bot] Schema ready. Starting Discord bot...", flush=True)
