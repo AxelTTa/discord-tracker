@@ -2,7 +2,9 @@
 nixPkgs = ["python312", "python312Packages.pip", "nodejs_20", "nodePackages.npm"]
 
 [phases.build]
-cmds = ["npm install -g @anthropic-ai/claude-code"]
+cmds = [
+  "npm install -g --prefix /usr/local @anthropic-ai/claude-code"
+]
 
 [start]
 cmd = "/opt/venv/bin/python bot.py"
