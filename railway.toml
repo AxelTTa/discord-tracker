@@ -2,8 +2,8 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = ".venv/bin/python tracker.py"
-healthcheckPath = "/health"
+startCommand = "python bot.py"
+healthcheckPath = "/internal/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
