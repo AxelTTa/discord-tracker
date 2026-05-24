@@ -454,7 +454,7 @@ def _start_bot_api():
 
 if __name__ == "__main__":
     import sys
-    print(f"[boot] PORT env={os.environ.get('PORT','<unset>')} BOT_API_PORT={BOT_API_PORT}", flush=True)
+    print(f"[boot-v2] PORT env={os.environ.get('PORT','<unset>')} BOT_API_PORT={BOT_API_PORT}", flush=True)
     sys.stdout.flush()
     # Start Flask first so Railway's health check can pass immediately
     print(f"[boot] Starting Flask on 0.0.0.0:{BOT_API_PORT}", flush=True)
