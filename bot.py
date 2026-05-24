@@ -452,15 +452,20 @@ def _start_bot_api():
     _bot_api.run(host="0.0.0.0", port=BOT_API_PORT, debug=False, use_reloader=False)
 
 
+def _init_and_run_bot():
+    """Run schema init + Discord bot in a thread so Flask can respond to health checks immediately."""
+    print(f"[bot] Connecting to Turso: {TURSO_URL}", flush=True)
+    init_schema()
+    print("[bot] Schema ready. Starting Discord bot...", flush=True)
+    client.run(TOKEN, log_handler=None)
+
+
 if __name__ == "__main__":
     import sys
-    print(f"[boot-v2] PORT env={os.environ.get('PORT','<unset>')} BOT_API_PORT={BOT_API_PORT}", flush=True)
-    sys.stdout.flush()
-    # Start Flask first so Railway's health check can pass immediately
-    print(f"[boot] Starting Flask on 0.0.0.0:{BOT_API_PORT}", flush=True)
-    t = threading.Thread(target=_start_bot_api, daemon=True)
-    t.start()
-    print(f"[boot] Connecting to Turso: {TURSO_URL}", flush=True)
-    init_schema()
-    print("[boot] Schema ready. Starting Discord bot...", flush=True)
-    client.run(TOKEN, log_handler=None)
+    print(f"[boot] PORT={os.environ.get('PORT','<unset>')} → binding Flask on 0.0.0.0:{BOT_API_PORT}", flush=True)
+    # Flask MUST start first — libsql holds the GIL during Turso I/O which blocks Flask responses
+    api_thread = threading.Thread(target=_start_bot_api, daemon=True)
+    api_thread.start()
+    bot_thread = threading.Thread(target=_init_and_run_bot)
+    bot_thread.start()
+    bot_thread.join()
