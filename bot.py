@@ -382,8 +382,22 @@ async def on_voice_state_update(member, before, after):
 
 # ---------- AI agent ----------
 
+def _ensure_claude_credentials():
+    """Write CLAUDE_CREDENTIALS env var to ~/.claude/.credentials.json if set."""
+    creds = os.environ.get("CLAUDE_CREDENTIALS", "")
+    if not creds:
+        return
+    creds_dir = Path.home() / ".claude"
+    creds_dir.mkdir(parents=True, exist_ok=True)
+    creds_file = creds_dir / ".credentials.json"
+    if not creds_file.exists():
+        creds_file.write_text(creds)
+        print("[claude] Wrote credentials from env", flush=True)
+
+
 def run_agent_query(question: str) -> dict:
     """Run a natural-language question through Claude Code CLI."""
+    _ensure_claude_credentials()
     claude_bin = shutil.which("claude") or "claude"
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     db_abs = str(_WORK_DIR / "tracker.db")
