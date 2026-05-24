@@ -37,7 +37,28 @@ if not TURSO_URL or not TURSO_TOKEN:
 
 
 # ---------- DB ----------
+# Use Turso embedded replica so tracker.db is kept locally for the AI agent to query.
+DB_PATH = os.environ.get("DB_PATH", "tracker.db")
+_embedded_conn = None
+
+
+def _init_embedded():
+    global _embedded_conn
+    try:
+        _embedded_conn = libsql.connect(DB_PATH, sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
+        _embedded_conn.sync()
+        print(f"[db] Embedded replica ready at {DB_PATH}", flush=True)
+    except Exception as e:
+        print(f"[db] Embedded replica failed ({e}), using remote", flush=True)
+
+
 def db():
+    if _embedded_conn is not None:
+        try:
+            _embedded_conn.sync()
+        except Exception:
+            pass
+        return _embedded_conn
     return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
 
 
@@ -425,6 +446,12 @@ def _find_claude() -> str:
 def run_agent_query(question: str) -> dict:
     """Run a natural-language question through Claude Code CLI."""
     _ensure_claude_credentials()
+    # Sync embedded replica so agent sees latest data
+    if _embedded_conn is not None:
+        try:
+            _embedded_conn.sync()
+        except Exception as e:
+            print(f"[agent] sync warning: {e}", flush=True)
     claude_bin = _find_claude()
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     db_abs = str(_WORK_DIR / "tracker.db")
@@ -502,6 +529,7 @@ def _init_and_run_bot():
     import time
     time.sleep(5)  # give Flask time to bind and pass the Railway health check
     print(f"[bot] Connecting to Turso: {TURSO_URL}", flush=True)
+    _init_embedded()
     init_schema()
     print("[bot] Schema ready. Starting Discord bot...", flush=True)
     client.run(TOKEN, log_handler=None)
