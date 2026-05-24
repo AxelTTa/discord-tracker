@@ -421,28 +421,6 @@ def _ensure_claude_credentials():
         print("[claude] Wrote settings.json", flush=True)
 
 
-def _find_claude() -> str:
-    """Locate the claude CLI binary, checking multiple candidate paths."""
-    candidates = [
-        shutil.which("claude"),
-        "/usr/local/bin/claude",
-        str(Path.home() / ".npm-global/bin/claude"),
-        str(Path.home() / ".local/bin/claude"),
-        "/root/.npm-global/bin/claude",
-        "/usr/bin/claude",
-    ]
-    for c in candidates:
-        if c and Path(c).is_file():
-            print(f"[claude] found at {c}", flush=True)
-            return c
-    # last-resort: find on disk
-    result = subprocess.run(["find", "/usr/local", "/root", "-name", "claude", "-type", "f"],
-                            capture_output=True, text=True, timeout=10)
-    found = result.stdout.strip().split("\n")[0] if result.stdout.strip() else ""
-    print(f"[claude] find result: {found!r} PATH={os.environ.get('PATH','')}", flush=True)
-    return found or "claude"
-
-
 def run_agent_query(question: str) -> dict:
     """Run a natural-language question through Claude Code CLI."""
     _ensure_claude_credentials()
@@ -452,7 +430,8 @@ def run_agent_query(question: str) -> dict:
             _embedded_conn.sync()
         except Exception as e:
             print(f"[agent] sync warning: {e}", flush=True)
-    claude_bin = _find_claude()
+    # Installed via npm install -g --prefix /usr/local in nixpacks build phase
+    claude_bin = shutil.which("claude") or "/usr/local/bin/claude"
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     db_abs = str(_WORK_DIR / "tracker.db")
     prompt = (
@@ -537,7 +516,7 @@ def _init_and_run_bot():
 
 if __name__ == "__main__":
     import sys
-    print(f"[boot] PORT={os.environ.get('PORT','<unset>')} → binding Flask on 0.0.0.0:{BOT_API_PORT}", flush=True)
+    print(f"[boot] PORT={BOT_API_PORT} Flask starting", flush=True)
     # Flask MUST start first — libsql holds the GIL during Turso I/O which blocks Flask responses
     api_thread = threading.Thread(target=_start_bot_api, daemon=True)
     api_thread.start()
