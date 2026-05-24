@@ -8,4 +8,4 @@ cmds = [
 ]
 
 [start]
-cmd = ".venv/bin/python tracker.py"
+cmd = ".venv/bin/python bot.py"

@@ -22,7 +22,8 @@ BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "60"))
 BACKFILL_CONCURRENCY = int(os.environ.get("BACKFILL_CONCURRENCY", "4"))
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "60"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-BOT_API_PORT = int(os.environ.get("BOT_API_PORT", "5001"))
+# Railway injects PORT; fall back to 5001 for local dev
+BOT_API_PORT = int(os.environ.get("PORT", os.environ.get("BOT_API_PORT", "5001")))
 
 _ask_lock = threading.Lock()
 _WORK_DIR = Path(__file__).parent.resolve()
